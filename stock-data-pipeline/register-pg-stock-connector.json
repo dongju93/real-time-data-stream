@@ -1,0 +1,19 @@
+{
+  "name": "stock-trades-connector",
+  "config": {
+    "connector.class": "io.debezium.connector.postgresql.PostgresConnector",
+    "tasks.max": "1",
+    "database.hostname": "postgres-stock",
+    "database.port": "5432",
+    "database.user": "debezium",
+    "database.password": "1q2w3e4r",
+    "database.dbname": "stock",
+    "database.server.name": "stock",
+    "publication.name": "dbz_publication",
+    "slot.name": "stock_trades_slot",
+    "plugin.name": "pgoutput",
+    "topic.prefix": "stock",
+    "snapshot.mode": "never",
+    "slot.drop.on.stop": false
+  }
+}
