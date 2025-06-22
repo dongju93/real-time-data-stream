@@ -1,9 +1,10 @@
 import asyncio
 
 from fastapi import APIRouter, BackgroundTasks, FastAPI, status
-from fastapi.responses import ORJSONResponse
+from fastapi.responses import ORJSONResponse, StreamingResponse
 from fastapi.websockets import WebSocket, WebSocketDisconnect
 
+from anomaly import AnomalyStreamer
 from database import get_connection
 from realtime import TickStreamer, TickUpdate
 from stock_generator import run_stock_data_inserter
@@ -94,6 +95,20 @@ async def stream_realtime_stock_data(websocket: WebSocket) -> None:
         if tasks_to_cancel:
             await asyncio.gather(*tasks_to_cancel, return_exceptions=True)
             logger.info("Tasks cancelled and cleaned up")
+
+
+@stock_streamer_v1.get("/stock/anomaly")
+async def stream_anomaly_stock_transaction() -> StreamingResponse:
+    anomaly_streamer = AnomalyStreamer(5.0)
+
+    return StreamingResponse(
+        anomaly_streamer.generate_sse_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+        },
+    )
 
 
 stock_streamer.include_router(stock_streamer_v1)
