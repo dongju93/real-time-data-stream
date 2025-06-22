@@ -1,8 +1,12 @@
+import asyncio
+
 from fastapi import APIRouter, BackgroundTasks, FastAPI, status
 from fastapi.responses import ORJSONResponse
+from fastapi.websockets import WebSocket, WebSocketDisconnect
 
 from database.connector import get_connection
 from stock_generator import run_stock_data_inserter
+from stock_realtime_socket import StockStreamer, TickUpdate
 from utils.logger import logger_instance
 from utils.serializer import serialize_value
 
@@ -47,6 +51,51 @@ async def generate_stock_data(background_tasks: BackgroundTasks) -> ORJSONRespon
         content={"status": "success", "message": "Stock data generation started"},
         status_code=status.HTTP_202_ACCEPTED,
     )
+
+
+@stock_streamer_v1.websocket("/stock/realtime")
+async def stream_realtime_stock_data(websocket: WebSocket):
+    await websocket.accept()
+    logger.info("WebSocket connection established")
+
+    # Initialize default values
+    initial_tick: TickUpdate = await websocket.receive_json()
+    ticker: str = initial_tick["ticker"]
+    tick: int = initial_tick["tick"]
+
+    tick_listen_task: asyncio.Task[None] | None = None
+    tick_stream_task: asyncio.Task[None] | None = None
+
+    try:
+        logger.info(f"Starting real-time stream for {ticker} with {tick}s tick")
+
+        stock_streamer = StockStreamer(ticker, tick, websocket)
+
+        # Create both tasks
+        tick_listen_task = asyncio.create_task(stock_streamer.listen_for_tick_updates())
+        tick_stream_task = asyncio.create_task(stock_streamer.stream_data())
+
+        # Run both task indefinitely
+        await asyncio.gather(tick_listen_task, tick_stream_task)
+
+    except WebSocketDisconnect:
+        logger.info(f"WebSocket disconnected for ticker: {ticker}")
+    except Exception as e:
+        logger.error(f"Error in WebSocket stream: {e}")
+        await websocket.close(1011)
+    finally:
+        tasks_to_cancel = []
+        if tick_listen_task:
+            tick_listen_task.cancel()  # Signal the task to cancel
+            tasks_to_cancel.append(tick_listen_task)
+        if tick_stream_task:
+            tick_stream_task.cancel()
+            tasks_to_cancel.append(tick_stream_task)
+
+        # Wait tasks are cancelled then clean up
+        if tasks_to_cancel:
+            await asyncio.gather(*tasks_to_cancel, return_exceptions=True)
+            logger.info("Tasks cancelled and cleaned up")
 
 
 stock_streamer.include_router(stock_streamer_v1)
