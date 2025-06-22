@@ -2,16 +2,18 @@ services:
   postgres-stock:
     image: timescale/timescaledb:latest-pg16
     container_name: postgres-stock
+    env_file:
+      - .env.compose.local
     environment:
-      - POSTGRES_PASSWORD=1q2w3e4r
-      - POSTGRES_DB=stock
       - TIMESCALEDB_TUNE=false
     ports:
       - 5432:5432
     restart: unless-stopped
     volumes:
       - postgres_data:/var/lib/postgresql/data
-      - ./pg_hba.conf:/var/lib/postgresql/data/pg_hba.conf
+    configs:
+      - source: pg_conf
+        target: /var/lib/postgresql/data/pg_hba.conf
     command:
       - "postgres"
       # CDC 설정
@@ -104,3 +106,7 @@ networks:
 
 volumes:
   postgres_data:
+
+configs:
+  pg_conf:
+    file: ./pg_hba.conf
