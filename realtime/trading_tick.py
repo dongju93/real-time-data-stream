@@ -19,7 +19,7 @@ class TickData(TypedDict):
     low: float
 
 
-class StockStreamer:
+class TickStreamer:
     def __init__(
         self,
         ticker: str,

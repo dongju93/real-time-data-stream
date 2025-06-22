@@ -5,7 +5,7 @@ from fastapi.responses import ORJSONResponse
 from fastapi.websockets import WebSocket, WebSocketDisconnect
 
 from database import get_connection
-from realtime import StockStreamer, TickUpdate
+from realtime import TickStreamer, TickUpdate
 from stock_generator import run_stock_data_inserter
 from utils import logger_instance, serialize_value
 
@@ -53,7 +53,7 @@ async def generate_stock_data(background_tasks: BackgroundTasks) -> ORJSONRespon
 
 
 @stock_streamer_v1.websocket("/stock/realtime")
-async def stream_realtime_stock_data(websocket: WebSocket):
+async def stream_realtime_stock_data(websocket: WebSocket) -> None:
     await websocket.accept()
     logger.info("WebSocket connection established")
 
@@ -67,7 +67,7 @@ async def stream_realtime_stock_data(websocket: WebSocket):
     try:
         logger.info(f"Starting real-time stream for {ticker} with {tick}s tick")
 
-        stock_streamer = StockStreamer(ticker, tick, websocket)
+        stock_streamer = TickStreamer(ticker, tick, websocket)
 
         # Create both tasks
         tick_listen_task = asyncio.create_task(stock_streamer.listen_for_tick_updates())

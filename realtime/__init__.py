@@ -1,3 +1,3 @@
-from .trading_tick import StockStreamer, TickUpdate
+from .trading_tick import TickStreamer, TickUpdate
 
-__all__ = ["StockStreamer", "TickUpdate"]
+__all__ = ["TickStreamer", "TickUpdate"]
