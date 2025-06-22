@@ -4,11 +4,10 @@ from fastapi import APIRouter, BackgroundTasks, FastAPI, status
 from fastapi.responses import ORJSONResponse
 from fastapi.websockets import WebSocket, WebSocketDisconnect
 
-from database.connector import get_connection
+from database import get_connection
+from realtime import StockStreamer, TickUpdate
 from stock_generator import run_stock_data_inserter
-from stock_realtime_socket import StockStreamer, TickUpdate
-from utils.logger import logger_instance
-from utils.serializer import serialize_value
+from utils import logger_instance, serialize_value
 
 logger = logger_instance()
 
@@ -58,7 +57,6 @@ async def stream_realtime_stock_data(websocket: WebSocket):
     await websocket.accept()
     logger.info("WebSocket connection established")
 
-    # Initialize default values
     initial_tick: TickUpdate = await websocket.receive_json()
     ticker: str = initial_tick["ticker"]
     tick: int = initial_tick["tick"]
