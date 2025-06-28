@@ -1,4 +1,6 @@
 import asyncio
+from contextlib import asynccontextmanager
+from typing import AsyncGenerator
 
 from fastapi import APIRouter, BackgroundTasks, FastAPI, status
 from fastapi.responses import ORJSONResponse, StreamingResponse
@@ -6,13 +8,30 @@ from fastapi.websockets import WebSocket, WebSocketDisconnect
 
 from anomaly import AnomalyStreamer
 from database import get_connection
+from database.connector import db_pool
 from realtime import TickStreamer, TickUpdate
 from stock_generator import run_stock_data_inserter
 from utils import logger_instance, serialize_value
 
 logger = logger_instance()
 
-stock_streamer = FastAPI(default_response_class=ORJSONResponse)
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI) -> AsyncGenerator[None, None]:
+    # 애플리케이션 시작 시 데이터베이스 풀 생성
+    logger.info("Creating database connection pool...")
+    await db_pool.create()
+    logger.info("Database connection pool created successfully")
+
+    yield
+
+    # 애플리케이션 종료 시 데이터베이스 풀 해제
+    logger.info("Closing database connection pool...")
+    await db_pool.close()
+    logger.info("Database connection pool closed successfully")
+
+
+stock_streamer = FastAPI(default_response_class=ORJSONResponse, lifespan=lifespan)
 
 stock_streamer_v1 = APIRouter(prefix="/api/v1")
 
@@ -107,6 +126,7 @@ async def stream_anomaly_stock_transaction() -> StreamingResponse:
         headers={
             "Cache-Control": "no-cache",
             "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
         },
     )
 

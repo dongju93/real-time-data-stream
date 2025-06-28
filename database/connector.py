@@ -50,6 +50,8 @@ db_pool = DatabasePool()
 
 @asynccontextmanager
 async def get_connection() -> AsyncGenerator[Connection]:
-    pool: Pool = await db_pool.create()
-    async with pool.acquire() as conn:
+    if not db_pool.pool:
+        raise RuntimeError("Database pool not initialized")
+
+    async with db_pool.pool.acquire() as conn:
         yield conn
