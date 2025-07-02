@@ -6,29 +6,57 @@ import asyncio
 import random
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from typing import NoReturn
+from typing import Annotated, Literal, NoReturn
 
+import numpy as np
+from pydantic import BaseModel, Field, field_validator
 from uuid_utils import UUID, uuid4, uuid7
 
 from database.connector import get_connection
+from utils.config_loader import get_config
 from utils.logger import logger_instance
 
 logger = logger_instance()
 
 
-@dataclass
-class TradeData:
-    """개별 트레이드 데이터를 나타내는 데이터클래스"""
+class TradeData(BaseModel):
+    """개별 트레이드 데이터를 나타내는 Pydantic 모델 - 강화된 데이터 검증"""
 
-    event_time: datetime
-    event_id: UUID
-    ticker: str
-    price: float
-    volume: int
-    trade_type: str
-    trade_id: UUID
-    market_code: str
-    currency_code: str
+    event_time: Annotated[datetime, Field(description="거래 발생 시간")]
+    event_id: Annotated[UUID, Field(description="이벤트 고유 식별자")]
+    ticker: Annotated[str, Field(min_length=1, max_length=10, description="주식 심볼")]
+    price: Annotated[
+        float, Field(gt=0, le=10000, description="거래 가격 (0 초과 10,000 이하)")
+    ]
+    volume: Annotated[
+        int, Field(gt=0, le=1000000, description="거래량 (0 초과 1,000,000 이하)")
+    ]
+    trade_type: Annotated[Literal["BUY", "SELL"], Field(description="거래 유형")]
+    trade_id: Annotated[UUID, Field(description="거래 고유 식별자")]
+    market_code: Annotated[
+        str, Field(min_length=1, max_length=20, description="시장 코드")
+    ]
+    currency_code: Annotated[
+        str, Field(min_length=3, max_length=3, description="통화 코드 (3자리)")
+    ]
+
+    @field_validator("ticker")
+    @classmethod
+    def ticker_must_be_uppercase(cls, v):
+        """ticker는 대문자여야 함"""
+        return v.upper()
+
+    @field_validator("currency_code")
+    @classmethod
+    def currency_code_must_be_uppercase(cls, v):
+        """통화 코드는 대문자여야 함"""
+        return v.upper()
+
+    @field_validator("price")
+    @classmethod
+    def price_precision(cls, v):
+        """가격은 소수점 둘째 자리까지만 허용"""
+        return round(v, 2)
 
     def to_tuple(self) -> tuple:
         """데이터베이스 삽입을 위한 튜플 변환"""
@@ -44,40 +72,127 @@ class TradeData:
             self.currency_code,
         )
 
+    model_config = {
+        "arbitrary_types_allowed": True,
+        "json_schema_extra": {
+            "example": {
+                "event_time": "2025-01-02T12:34:56.789Z",
+                "event_id": "01234567-89ab-cdef-0123-456789abcdef",
+                "ticker": "AAPL",
+                "price": 150.25,
+                "volume": 1000,
+                "trade_type": "BUY",
+                "trade_id": "fedcba98-7654-3210-fedc-ba9876543210",
+                "market_code": "NASDAQ",
+                "currency_code": "USD",
+            }
+        },
+    }
+
 
 @dataclass
 class StockDataGenerator:
-    """주식 데이터 생성기"""
+    """주식 데이터 생성기 - 설정 기반 초기화"""
 
-    tickers: list[str]
-    trade_types: list[str] = field(default_factory=lambda: ["BUY", "SELL"])  # immutable
-    market_code: str = "NASDAQ"
-    currency_code: str = "USD"
+    tickers: list[str] = field(default_factory=list)
+    trade_types: list[str] = field(default_factory=list)
+    market_code: str = ""
+    currency_code: str = ""
+
+    def __post_init__(self):
+        """설정 파일에서 기본값들을 로드"""
+        if not self.tickers:
+            # 모든 섹터의 ticker들을 합쳐서 사용
+            all_tickers = []
+            ticker_sections = [
+                "big_tech",
+                "finance",
+                "consumer",
+                "healthcare",
+                "energy",
+                "retail",
+                "industrial",
+                "fintech",
+                "media",
+            ]
+
+            for section in ticker_sections:
+                section_tickers = get_config("stock_generator", "tickers", section)
+                if section_tickers:
+                    all_tickers.extend(section_tickers)
+
+            self.tickers = all_tickers
+
+        if not self.trade_types:
+            self.trade_types = get_config("stock_generator", "market", "trade_types")
+
+        if not self.market_code:
+            self.market_code = get_config("stock_generator", "market", "market_code")
+
+        if not self.currency_code:
+            self.currency_code = get_config(
+                "stock_generator", "market", "currency_code"
+            )
 
     def generate_trade_batch(
         self, trade_transaction_per_second: int
     ) -> list[TradeData]:
-        """트레이드 데이터 배치 생성 (현재시간 +1초부터 +10초까지)"""
+        """트레이드 데이터 배치 생성 (현재시간 +1초부터 +10초까지) - NumPy 벡터화 최적화"""
         logger.info(
             f"📊 트레이드 데이터 배치 생성 중... (배치 크기: {trade_transaction_per_second}건)"
         )
-        trades: list[TradeData] = []
-        base_time: datetime = datetime.now(tz=UTC)
 
-        for _ in range(trade_transaction_per_second):
-            # 현재시간 +1초부터 +10초까지 밀리초 정밀도로 랜덤 분배
-            time_offset: float = random.uniform(1.0, 10.0)
-            event_time: datetime = datetime.fromtimestamp(
-                base_time.timestamp() + time_offset, tz=UTC
+        base_time: datetime = datetime.now(tz=UTC)
+        base_timestamp = base_time.timestamp()
+
+        # NumPy를 사용한 벡터화된 랜덤 값 생성
+        rng = np.random.default_rng(42)
+
+        # 설정에서 범위값들 로드
+        time_min = get_config("stock_generator", "data_ranges", "time_offset_min")
+        time_max = get_config("stock_generator", "data_ranges", "time_offset_max")
+        price_min = get_config("stock_generator", "data_ranges", "price_min")
+        price_max = get_config("stock_generator", "data_ranges", "price_max")
+        volume_min = get_config("stock_generator", "data_ranges", "volume_min")
+        volume_max = get_config("stock_generator", "data_ranges", "volume_max")
+
+        # 시간 오프셋: 설정값 기반 랜덤한 값들
+        time_offsets = rng.uniform(
+            time_min, time_max, size=trade_transaction_per_second
+        )
+
+        # 가격: 설정값 기반 랜덤한 값들 (소수점 둘째 자리까지)
+        prices = np.round(
+            rng.uniform(price_min, price_max, size=trade_transaction_per_second), 2
+        )
+
+        # 거래량: 설정값 기반 랜덤한 정수들
+        volumes = rng.integers(
+            volume_min, volume_max + 1, size=trade_transaction_per_second
+        )
+
+        # ticker와 trade_type 인덱스를 랜덤하게 선택
+        ticker_indices = rng.integers(
+            0, len(self.tickers), size=trade_transaction_per_second
+        )
+        trade_type_indices = rng.integers(
+            0, len(self.trade_types), size=trade_transaction_per_second
+        )
+
+        # TradeData 객체들 생성
+        trades: list[TradeData] = []
+        for i in range(trade_transaction_per_second):
+            event_time = datetime.fromtimestamp(
+                base_timestamp + time_offsets[i], tz=UTC
             )
 
             trade = TradeData(
                 event_time=event_time,
                 event_id=uuid7(),
-                ticker=random.choice(self.tickers),
-                price=round(random.uniform(100.0, 500.0), 2),
-                volume=random.randint(1, 1000),
-                trade_type=random.choice(self.trade_types),
+                ticker=self.tickers[ticker_indices[i]],
+                price=float(prices[i]),
+                volume=int(volumes[i]),
+                trade_type=self.trade_types[trade_type_indices[i]],
                 trade_id=uuid4(),
                 market_code=self.market_code,
                 currency_code=self.currency_code,
@@ -85,19 +200,19 @@ class StockDataGenerator:
             trades.append(trade)
 
         logger.info(
-            f"✅ 트레이드 데이터 배치 생성 완료 ({len(trades)}건, 시간범위: +1~+10초 밀리초 정밀도 랜덤분배)"
+            f"✅ 트레이드 데이터 배치 생성 완료 ({len(trades)}건, 시간범위: +1~+10초 밀리초 정밀도 랜덤분배) - NumPy 벡터화 적용"
         )
         return trades
 
     def generate_distributed_trades(
         self, trade_transaction_per_second: int
     ) -> list[TradeData]:
-        """향후 10초간 각 1초마다 다른 랜덤 크기로 분산 생성"""
+        """향후 10초간 각 1초마다 다른 랜덤 크기로 분산 생성 - NumPy 벡터화 최적화"""
         logger.info(
             f"📊 10초간 분산 트레이드 데이터 생성 시작 (총 목표: {trade_transaction_per_second}건)"
         )
-        all_trades: list[TradeData] = []
         base_time: datetime = datetime.now(tz=UTC)
+        base_timestamp = base_time.timestamp()
 
         # 총 batch_size를 10초에 걸쳐 랜덤하게 분배
         remaining_size = trade_transaction_per_second
@@ -119,30 +234,51 @@ class StockDataGenerator:
 
         logger.info(f"🎲 각 초별 데이터 크기: {second_sizes}")
 
+        # NumPy를 사용한 벡터화된 랜덤 값 생성
+        rng = np.random.default_rng(42)
+        all_trades: list[TradeData] = []
+
         # 각 초별로 데이터 생성
         for second, size in enumerate(second_sizes):
             if size > 0:
-                for _ in range(size):
-                    # 해당 초의 시간 범위 내에서 랜덤 시간 설정
-                    time_offset = second + 1 + random.uniform(0, 0.999)
+                # 해당 초의 시간 범위 내에서 랜덤 시간들 생성 (벡터화)
+                time_within_second = rng.uniform(0, 0.999, size=size)
+                time_offsets = second + 1 + time_within_second
+
+                # 설정에서 범위값들 로드
+                price_min = get_config("stock_generator", "data_ranges", "price_min")
+                price_max = get_config("stock_generator", "data_ranges", "price_max")
+                volume_min = get_config("stock_generator", "data_ranges", "volume_min")
+                volume_max = get_config("stock_generator", "data_ranges", "volume_max")
+
+                # 가격, 거래량, ticker/trade_type 인덱스를 벡터화로 생성
+                prices = np.round(rng.uniform(price_min, price_max, size=size), 2)
+                volumes = rng.integers(volume_min, volume_max + 1, size=size)
+                ticker_indices = rng.integers(0, len(self.tickers), size=size)
+                trade_type_indices = rng.integers(0, len(self.trade_types), size=size)
+
+                # TradeData 객체들 생성
+                for i in range(size):
                     event_time = datetime.fromtimestamp(
-                        base_time.timestamp() + time_offset, tz=UTC
+                        base_timestamp + time_offsets[i], tz=UTC
                     )
 
                     trade = TradeData(
                         event_time=event_time,
                         event_id=uuid7(),
-                        ticker=random.choice(self.tickers),
-                        price=round(random.uniform(100.0, 500.0), 2),
-                        volume=random.randint(1, 1000),
-                        trade_type=random.choice(self.trade_types),
+                        ticker=self.tickers[ticker_indices[i]],
+                        price=float(prices[i]),
+                        volume=int(volumes[i]),
+                        trade_type=self.trade_types[trade_type_indices[i]],
                         trade_id=uuid4(),
                         market_code=self.market_code,
                         currency_code=self.currency_code,
                     )
                     all_trades.append(trade)
 
-        logger.info(f"✅ 분산 트레이드 데이터 생성 완료 ({len(all_trades)}건)")
+        logger.info(
+            f"✅ 분산 트레이드 데이터 생성 완료 ({len(all_trades)}건) - NumPy 벡터화 적용"
+        )
         return all_trades
 
 
@@ -151,14 +287,51 @@ class StockDataInserter:
     """주식 데이터를 데이터베이스에 삽입하는 클래스"""
 
     async def insert_trades_batch(self, trades: list[TradeData]) -> int:
-        """트레이드 데이터 배치를 데이터베이스에 삽입"""
+        """트레이드 데이터 배치를 데이터베이스에 고성능 삽입 (COPY 명령 활용)"""
         if not trades:
             logger.warning("🔴 삽입할 트레이드 데이터가 없습니다")
             return 0
 
-        logger.info(f"💾 데이터베이스에 {len(trades)}건의 트레이드 데이터 삽입 시작")
+        logger.info(
+            f"💾 데이터베이스에 {len(trades)}건의 트레이드 데이터 고성능 삽입 시작"
+        )
 
-        # 삽입 쿼리 정의 (stock_trades 테이블 스키마에 맞춤)
+        try:
+            async with get_connection() as conn:
+                # COPY를 위한 데이터 준비 - 튜플 리스트로 변환
+                trade_tuples = [trade.to_tuple() for trade in trades]
+
+                # copy_records_to_table을 사용하여 고성능 배치 삽입
+                # PostgreSQL의 COPY 명령을 사용하므로 executemany보다 10-100배 빠름
+                await conn.copy_records_to_table(
+                    "stock_trades",
+                    records=trade_tuples,
+                    columns=[
+                        "event_time",
+                        "event_id",
+                        "ticker",
+                        "price",
+                        "volume",
+                        "trade_type",
+                        "trade_id",
+                        "market_code",
+                        "currency_code",
+                    ],
+                )
+
+                logger.info(
+                    f"✅ {len(trades)}건의 트레이드 데이터 고성능 삽입 완료 (COPY 명령 사용)"
+                )
+                return len(trades)
+
+        except Exception as e:
+            logger.error(f"❌ 데이터베이스 고성능 삽입 중 오류 발생: {e}")
+            # COPY 실패시 fallback으로 기존 방식 사용
+            logger.info("🔄 COPY 실패, executemany 방식으로 재시도...")
+            return await self._insert_trades_fallback(trades)
+
+    async def _insert_trades_fallback(self, trades: list[TradeData]) -> int:
+        """COPY 실패시 사용할 fallback 삽입 방식"""
         insert_query = """
             INSERT INTO stock_trades (
                 event_time, event_id, ticker, price, volume, 
@@ -168,21 +341,12 @@ class StockDataInserter:
 
         try:
             async with get_connection() as conn:
-                # 배치 삽입을 위한 데이터 준비
                 trade_tuples = [trade.to_tuple() for trade in trades]
-
-                # executemany를 사용하여 배치 삽입
                 await conn.executemany(insert_query, trade_tuples)
-
-                logger.info(f"✅ {len(trades)}건의 트레이드 데이터 삽입 완료")
+                logger.info(f"✅ {len(trades)}건의 트레이드 데이터 fallback 삽입 완료")
                 return len(trades)
-
-            # 연결을 얻지 못한 경우
-            logger.error("❌ 데이터베이스 연결을 얻을 수 없습니다")
-            return 0
-
         except Exception as e:
-            logger.error(f"❌ 데이터베이스 삽입 중 오류 발생: {e}")
+            logger.error(f"❌ fallback 삽입 중 오류 발생: {e}")
             raise
 
     async def generate_and_insert(
@@ -220,24 +384,47 @@ class StockDataInserter:
         return inserted_count
 
 
-async def run_stock_data_inserter(trade_transaction_per_second: int = 1000) -> NoReturn:
-    """주식 데이터 생성 및 삽입 실행 - 10초마다 10~(trade_transaction_per_second*10)개의 랜덤 크기 데이터 생성"""
-    tickers = ["AAPL", "GOOGL", "MSFT", "AMZN", "TSLA"]
-    generator = StockDataGenerator(tickers)
+async def run_stock_data_inserter(
+    trade_transaction_per_second: int | None = None,
+) -> NoReturn:
+    """주식 데이터 생성 및 삽입 실행 - 설정 기반 동적 파라미터"""
+
+    # 설정에서 기본값들 로드
+    if trade_transaction_per_second is None:
+        trade_transaction_per_second = get_config(
+            "stock_generator", "generation", "default_batch_size"
+        )
+
+    min_batch_size = get_config("stock_generator", "generation", "min_batch_size")
+    max_batch_multiplier = get_config(
+        "stock_generator", "generation", "max_batch_multiplier"
+    )
+    distribution_seconds = get_config(
+        "stock_generator", "generation", "distribution_seconds"
+    )
+
+    # 설정 기반으로 generator와 inserter 생성 (ticker는 자동으로 config에서 로드됨)
+    generator = StockDataGenerator()
     inserter = StockDataInserter()
+
+    logger.info(
+        f"📈 주식 데이터 생성기 시작 - 기본 배치 크기: {trade_transaction_per_second}, "
+        f"최소: {min_batch_size}, 최대 배수: {max_batch_multiplier}x, "
+        f"분산 시간: {distribution_seconds}초"
+    )
 
     while True:
         try:
-            # 10개부터 (trade_transaction_per_second*10)개까지 랜덤한 크기로 데이터 생성
-            min_size = 10
-            max_size = trade_transaction_per_second * 10
+            # 설정 기반 랜덤 배치 크기 계산
+            min_size = min_batch_size
+            max_size = trade_transaction_per_second * max_batch_multiplier
             random_batch_size = random.randint(min_size, max_size)
 
             logger.info(
                 f"🎲 랜덤 배치 크기 결정: {random_batch_size}개 (범위: {min_size}~{max_size})"
             )
 
-            # 10초간 각 초별로 다른 크기로 분산 트레이드 데이터 생성 및 삽입
+            # 설정된 시간 동안 분산 트레이드 데이터 생성 및 삽입
             inserted_count = await inserter.generate_distributed_and_insert(
                 generator, trade_transaction_per_second=random_batch_size
             )
@@ -247,5 +434,5 @@ async def run_stock_data_inserter(trade_transaction_per_second: int = 1000) -> N
         except Exception as e:
             logger.error(f"❌ 데이터 삽입 중 오류 발생: {e}")
 
-        # 10초 대기 후 다음 배치 생성
-        await asyncio.sleep(10)
+        # 설정된 시간만큼 대기 후 다음 배치 생성
+        await asyncio.sleep(distribution_seconds)
