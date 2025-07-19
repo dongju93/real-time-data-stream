@@ -17,7 +17,7 @@ logger = logger_instance()
 
 
 @asynccontextmanager
-async def lifespan(_app: FastAPI) -> AsyncGenerator[None, None]:
+async def lifespan(_: FastAPI) -> AsyncGenerator[None, None]:
     # 애플리케이션 시작 시 데이터베이스 풀 생성
     await db_pool.create()
     logger.info("Database connection pool created successfully")
