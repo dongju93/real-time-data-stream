@@ -2,10 +2,10 @@
 PostgreSQL 의 지난 기간 주식 데이터를 조회
 """
 
-from datetime import datetime, timedelta
-from typing import Any
+from datetime import UTC, datetime, timedelta
+from typing import Annotated, Any
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from pydantic.alias_generators import to_camel
 
 from database import get_connection
@@ -17,12 +17,46 @@ logger = logger_instance()
 class StockTradeQuery(BaseModel):
     model_config = ConfigDict(alias_generator=to_camel, extra="forbid")
 
-    duration: int | None = Field(
-        None, description="Duration in minutes from current time", ge=1
-    )
-    ticker: str | None = Field(None, description="Stock ticker symbol")
-    trade_type: str | None = Field(None, description="Trade type (BUY/SELL)")
-    market_code: str | None = Field(None, description="Market code")
+    duration: Annotated[
+        int | None,
+        Field(None, description="Duration in minutes from current time", ge=1),
+    ] = None
+    ticker: Annotated[str | None, Field(None, description="Stock ticker symbol")] = None
+    trade_type: Annotated[
+        str | None, Field(None, description="Trade type (BUY/SELL)")
+    ] = None
+    market_code: Annotated[str | None, Field(None, description="Market code")] = None
+
+    @field_validator("ticker")
+    @classmethod
+    def validate_ticker(cls, value: str | None) -> str | None:
+        """Validate ticker symbol format."""
+        if value is None:
+            return value
+        if not all(c.isalnum() or c in [".", "-", "_"] for c in value):
+            raise ValueError("Invalid ticker symbol format")
+        return value
+
+    @field_validator("trade_type")
+    @classmethod
+    def validate_trade_type(cls, value: str | None) -> str | None:
+        """Validate trade type."""
+        if value is None:
+            return value
+        value_upper = value.upper()
+        if value_upper not in ["BUY", "SELL"]:
+            raise ValueError("Invalid trade type - must be BUY or SELL")
+        return value_upper
+
+    @field_validator("market_code")
+    @classmethod
+    def validate_market_code(cls, value: str | None) -> str | None:
+        """Validate market code format."""
+        if value is None:
+            return value
+        if not value.isalnum():
+            raise ValueError("Invalid market code format")
+        return value
 
 
 class StockTradeFilters(BaseModel):
@@ -42,63 +76,41 @@ class StockTradeRepository:
     """Repository class for handling stock trade data operations with SQL injection protection."""
 
     @classmethod
-    def _validate_ticker(cls, ticker: str) -> str:
-        """Validate ticker symbol format."""
-        if not all(c.isalnum() or c in [".", "-", "_"] for c in ticker):
-            raise ValueError("Invalid ticker symbol format")
-        return ticker
-
-    @classmethod
-    def _validate_trade_type(cls, trade_type: str) -> str:
-        """Validate trade type."""
-        trade_type_upper = trade_type.upper()
-        if trade_type_upper not in ["BUY", "SELL"]:
-            raise ValueError("Invalid trade type - must be BUY or SELL")
-        return trade_type_upper
-
-    @classmethod
-    def _validate_market_code(cls, market_code: str) -> str:
-        """Validate market code format."""
-        if not market_code.isalnum():
-            raise ValueError("Invalid market code format")
-        return market_code
-
-    @classmethod
     def _build_query_conditions(
         cls, query: StockTradeQuery
     ) -> tuple[list[str], list[Any]]:
         """Build parameterized query conditions with validation."""
         conditions = []
         params = []
-        param_count = 1
+        # Index for parameterized queries position
+        param_index = 1
 
         # Add event_time filter if duration is provided
         if query.duration is not None:
-            start_time = datetime.now() - timedelta(minutes=query.duration)
-            conditions.append(f"event_time >= ${param_count}")
+            start_time: datetime = datetime.now(tz=UTC) - timedelta(
+                minutes=query.duration
+            )
+            conditions.append(f"event_time >= ${param_index}")
             params.append(start_time)
-            param_count += 1
+            param_index += 1
 
-        # Add ticker filter with validation
+        # Add ticker filter
         if query.ticker is not None:
-            validated_ticker = cls._validate_ticker(query.ticker)
-            conditions.append(f"ticker = ${param_count}")
-            params.append(validated_ticker)
-            param_count += 1
+            conditions.append(f"ticker = ${param_index}")
+            params.append(query.ticker)
+            param_index += 1
 
-        # Add trade_type filter with validation
+        # Add trade_type filter
         if query.trade_type is not None:
-            validated_trade_type = cls._validate_trade_type(query.trade_type)
-            conditions.append(f"trade_type = ${param_count}")
-            params.append(validated_trade_type)
-            param_count += 1
+            conditions.append(f"trade_type = ${param_index}")
+            params.append(query.trade_type)
+            param_index += 1
 
-        # Add market_code filter with validation
+        # Add market_code filter
         if query.market_code is not None:
-            validated_market_code = cls._validate_market_code(query.market_code)
-            conditions.append(f"market_code = ${param_count}")
-            params.append(validated_market_code)
-            param_count += 1
+            conditions.append(f"market_code = ${param_index}")
+            params.append(query.market_code)
+            param_index += 1
 
         return conditions, params
 
@@ -117,8 +129,8 @@ class StockTradeRepository:
         # Build the complete query
         base_query = "SELECT * FROM stock_trades"
         if conditions:
-            where_clause = " WHERE " + " AND ".join(conditions)
-            sql_query = (
+            where_clause: str = " WHERE " + " AND ".join(conditions)
+            sql_query: str = (
                 base_query + where_clause + " ORDER BY event_time DESC LIMIT 1000"
             )
         else:
