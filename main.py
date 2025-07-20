@@ -1,14 +1,16 @@
 import asyncio
+from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
-from typing import AsyncGenerator
+from typing import Annotated
 
-from fastapi import APIRouter, BackgroundTasks, FastAPI, status
+from fastapi import APIRouter, BackgroundTasks, Depends, FastAPI, status
 from fastapi.responses import ORJSONResponse, StreamingResponse
 from fastapi.websockets import WebSocket, WebSocketDisconnect
 
 from anomaly import AnomalyStreamer
 from database import get_connection
 from database.connector import db_pool
+from history import StockTradeQuery, StockTradeRepository, StockTradeResponse
 from realtime import TickStreamer, TickUpdate
 from stock_generator import run_stock_data_inserter
 from utils import logger_instance, serialize_value
@@ -70,7 +72,36 @@ async def generate_stock_data(background_tasks: BackgroundTasks) -> ORJSONRespon
     )
 
 
-@stock_streamer_v1.websocket("/stock/realtime")
+@stock_streamer_v1.get("/stock")
+async def get_stock_trades(
+    query: Annotated[StockTradeQuery, Depends()],
+) -> ORJSONResponse:
+    """Fetch stock trades from the database with optional filters.
+
+    Args:
+        query: StockTradeQuery containing filter parameters
+
+    Returns:
+        ORJSONResponse: List of filtered stock trades
+    """
+    try:
+        result: StockTradeResponse = await StockTradeRepository.fetch_trades(query)
+
+        return ORJSONResponse(
+            content=result.model_dump(),
+            status_code=status.HTTP_200_OK,
+        )
+
+    except Exception as e:
+        logger.error(f"Error fetching stock trades: {e}")
+        return ORJSONResponse(
+            content={"error": "Failed to fetch stock trades", "detail": str(e)},
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
+
+
+# wss
+@stock_streamer_v1.websocket("/stock/real-time")
 async def stream_realtime_stock_data(websocket: WebSocket) -> None:
     await websocket.accept()
     logger.info("WebSocket connection established")
