@@ -11,10 +11,12 @@ from pydantic.alias_generators import to_camel
 from database import get_connection
 from utils import logger_instance, serialize_value
 
+from .validation_mixins import UppercaseAlphabetValidationMixin
+
 logger = logger_instance()
 
 
-class StockTradeQuery(BaseModel):
+class StockTradeQuery(BaseModel, UppercaseAlphabetValidationMixin):
     model_config = ConfigDict(alias_generator=to_camel, extra="forbid")
 
     duration: Annotated[
@@ -27,36 +29,16 @@ class StockTradeQuery(BaseModel):
     ] = None
     market_code: Annotated[str | None, Field(None, description="Market code")] = None
 
-    @field_validator("ticker")
-    @classmethod
-    def validate_ticker(cls, value: str | None) -> str | None:
-        """Validate ticker symbol format."""
-        if value is None:
-            return value
-        if not all(c.isalnum() or c in [".", "-", "_"] for c in value):
-            raise ValueError("Invalid ticker symbol format")
-        return value
-
     @field_validator("trade_type")
     @classmethod
     def validate_trade_type(cls, value: str | None) -> str | None:
         """Validate trade type."""
         if value is None:
             return value
-        value_upper = value.upper()
+        value_upper: str = value.upper()
         if value_upper not in ["BUY", "SELL"]:
             raise ValueError("Invalid trade type - must be BUY or SELL")
         return value_upper
-
-    @field_validator("market_code")
-    @classmethod
-    def validate_market_code(cls, value: str | None) -> str | None:
-        """Validate market code format."""
-        if value is None:
-            return value
-        if not value.isalnum():
-            raise ValueError("Invalid market code format")
-        return value
 
 
 class StockTradeFilters(BaseModel):
