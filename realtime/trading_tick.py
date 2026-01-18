@@ -1,22 +1,13 @@
 import asyncio
-from typing import TypedDict
 
 from fastapi import WebSocket
 
 from database.connector import get_connection
 from utils.logger import logger_instance
 
+from .model import TickData, TickUpdate, TradeHighAndLow
+
 logger = logger_instance()
-
-
-class TickUpdate(TypedDict):
-    ticker: str
-    tick: int
-
-
-class TickData(TypedDict):
-    high: float
-    low: float
 
 
 class TickStreamer:
@@ -69,28 +60,28 @@ class TickStreamer:
                     if result:
                         # Candle data serialization
                         stock_data: dict[str, str | int] = dict(result[0])
-                        serialized_data: TickData = TickData(
+                        tick_data: TickData = TickData(
                             high=float(stock_data["price"]),
                             low=float(stock_data["price"]),
                         )
 
                         await self.websocket.send_json(
-                            {
-                                "type": "candle_tick",
-                                "ticker": self.ticker,
-                                "data": serialized_data,
-                                "current_tick": self.tick,
-                            }
+                            TradeHighAndLow(
+                                type="candle_tick",
+                                ticker=self.ticker,
+                                data=tick_data,
+                                current_tick=self.tick,
+                            )
                         )
                     else:
                         # // TODO: If no data found, just wait tick data
                         await self.websocket.send_json(
-                            {
-                                "type": "candle_tick",
-                                "ticker": self.ticker,
-                                "message": None,
-                                "current_tick": self.tick,
-                            }
+                            TradeHighAndLow(
+                                type="candle_tick",
+                                ticker=self.ticker,
+                                data=None,
+                                current_tick=self.tick,
+                            )
                         )
 
                 await asyncio.sleep(self.tick)

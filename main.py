@@ -11,7 +11,8 @@ from anomaly import AnomalyStreamer
 from database import get_connection
 from database.connector import db_pool
 from history import StockTradeQuery, StockTradeRepository, StockTradeResponse
-from realtime import TickStreamer, TickUpdate
+from realtime import TickStreamer
+from realtime.model import RealtimeTickUpdate
 from stock_generator import run_stock_data_inserter
 from utils import logger_instance, serialize_value
 
@@ -106,9 +107,13 @@ async def stream_realtime_stock_data(websocket: WebSocket) -> None:
     await websocket.accept()
     logger.info("WebSocket connection established")
 
-    initial_tick: TickUpdate = await websocket.receive_json()
-    ticker: str = initial_tick["ticker"]
-    tick: int = initial_tick["tick"]
+    # 1. get data from websocket message
+    raw_data = await websocket.receive_json()
+    # 2. validate date from get data
+    initial_tick: RealtimeTickUpdate = RealtimeTickUpdate.model_validate(raw_data)
+    # 3. allocate each vars
+    ticker: str = initial_tick.ticker
+    tick: int = initial_tick.tick
 
     tick_listen_task: asyncio.Task[None] | None = None
     tick_stream_task: asyncio.Task[None] | None = None
