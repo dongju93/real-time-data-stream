@@ -39,6 +39,16 @@ flowchart TD
 - 데이터 정합성 보장: 트랜잭션 커밋과 동시에 이벤트 발행
 - 기존 레거시 시스템 변경 최소화
 
+## 성능 요구사항 (Performance Requirements)
+
+### Production 환경 기준
+
+| #   | 시나리오                           | HW 사양                       | 대상 메트릭                                 | 요구사항                                            |
+| --- | ---------------------------------- | ----------------------------- | ------------------------------------------- | --------------------------------------------------- |
+| 1   | **실시간 호가 전송 (WebSocket)**   | 4 CPU / 8GB RAM / 25Gbps NIC  | 1,000개 동시 연결, 초당 5,000건 거래 데이터 | End-to-End 지연시간 < 100ms (DB 커밋 → Client 수신) |
+| 2   | **거래 데이터 삽입 (Bulk Insert)** | 8 CPU / 16GB RAM / SSD        | 배치당 10,000건 거래 데이터                 | 처리시간 < 500ms (asyncpg COPY 메서드 사용)         |
+| 3   | **히스토리 조회 (REST API)**       | 4 CPU / 8GB RAM / TimescaleDB | 30일치 데이터 조회 (약 1,296,000건)         | 응답시간 < 2초 (TimescaleDB 파티셔닝 활용)          |
+
 ## Tech Stack
 
 - `FastAPI` - 0.115.12
@@ -82,7 +92,16 @@ flowchart TD
 - `GET ws://<HOST>/api/v1/stock/real-time`
   - Description: 사용자의 실시간 거래내역(Tick) 을 요청 시 서비스에서 WebSocket 연결을 하여 Kafka 의 메시지를 전달한다
   - Features
-    - [ ] TBD
+    - 실시간 호가 시작
+      - [ ] Client 가 WebSocket 연결을 통해 Ticker 이름과 Tick 주기를 Server 에 요청
+      - [ ] Server 가 요청받은 Ticker 의 Kafka 토픽 구독 시작
+      - [ ] Server 가 설정된 주기로 호가 데이터를 Client 에 전송
+      - [ ] Client 가 실시간 호가 데이터를 수신 및 렌더링
+    - 실시간 호가 변경
+      - [ ] Server 가 기존 실시간 데이터 전송 중 새로운 Ticker 혹은 Tick 주기 변경 요청을 감지
+      - [ ] Server 가 기존 Ticker 의 Kafka 구독 해제
+      - [ ] Server 가 새로운 Ticker 의 Kafka 구독 시작
+      - [ ] Server 가 갱신된 Tick 주기로 호가 데이터 전송 재개
 
 ### Anomaly
 
