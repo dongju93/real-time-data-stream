@@ -108,11 +108,56 @@ flowchart TD
 - `GET http://<HOST>/api/v1/stock/anomaly`
   - Description: 사용자의 거래 이상 거래 탐지 확인 요청 시 SSE 로 발생 내역을 전달한다
   - Features
-    - [ ] TBD
+    - [ ] Flink 이상 거래 결과를 Kafka 또는 조회 가능한 스트림으로 노출
+    - [ ] 서비스가 이상 거래 이벤트를 subscribe 하여 SSE 형식으로 변환
+    - [ ] 이벤트 타입, 발생 시각, ticker, 이상 탐지 근거를 포함한 응답 스키마 정의
+    - [ ] 클라이언트 연결 종료 시 consumer 정리 및 재연결 처리
+    - [ ] keep-alive 및 heartbeat 이벤트 처리
+    - [ ] 이상 거래 없음 / 지연 / 처리 실패에 대한 예외 응답 정책 정의
 
 ### Trades
 
 - `GET http://<HOST>/api/v1/stock`
   - Description: 지난 거래내역에 대한 조회 요청 시 RestAPI 로 제공한다
   - Features
-    - [ ] TBD
+    - [ ] duration, ticker, tradeType, marketCode 조건 조합 조회
+    - [ ] 분/시간/일 단위 집계 조회 API 설계
+    - [ ] 시작 시각, 종료 시각 기반 기간 조회 지원
+    - [ ] 대용량 조회를 위한 pagination 또는 cursor 기반 응답 지원
+    - [ ] count, filters, aggregate metadata 를 포함한 응답 형식 표준화
+    - [ ] 잘못된 파라미터, 빈 결과, 최대 조회 범위 초과에 대한 검증 정책 정의
+
+## 개발 항목
+
+### 1. 실시간 Tick 스트리밍 완성
+
+- [ ] Kafka consumer 를 애플리케이션 런타임 의존성으로 반영
+- [ ] Debezium CDC 메시지 스키마 파싱 로직 구현
+- [ ] WebSocket 연결별 ticker / tick 설정 상태 관리
+- [ ] ticker 변경 시 기존 구독 해제 후 신규 구독 연결
+- [ ] 수신 이벤트를 tick 주기 기준 candle/high-low 데이터로 집계
+- [ ] 데이터 부재, 지연, consumer 오류에 대한 WebSocket 예외 처리
+
+### 2. 이상 거래 SSE 완성
+
+- [ ] Flink 출력 토픽 또는 결과 스트림 스키마 확정
+- [ ] 이상 거래 이벤트 consumer 구현
+- [ ] SSE event/data 포맷 표준화
+- [ ] heartbeat, reconnect, graceful shutdown 처리
+- [ ] 이상 거래 이벤트 필터링 및 직렬화
+
+### 3. 히스토리 조회 고도화
+
+- [ ] 현재 필터 조회 API를 range query 중심으로 확장
+- [ ] 분/시간/일 aggregation 쿼리 추가
+- [ ] pagination 또는 cursor 응답 도입
+- [ ] 대량 데이터 조회 성능 검증
+- [ ] 응답 모델 및 validation 정리
+
+### 4. 운영 안정성 보강
+
+- [ ] Kafka, PostgreSQL, Flink 설정을 `env.toml` 기반으로 통합
+- [ ] 구조화된 로그와 장애 추적 포인트 추가
+- [ ] 연결 종료, 재시도, backpressure 처리 정책 정리
+- [ ] 통합 테스트 또는 최소한의 회귀 테스트 추가
+- [ ] 성능 요구사항 기준 점검 시나리오 문서화
