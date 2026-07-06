@@ -6,11 +6,15 @@ readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
     "asyncpg==0.31.0",
+    "confluent-kafka==2.15.0",
     "fastapi[standard]==0.139.0",
     "numpy==2.5.1",
     "orjson==3.11.9",
     "uuid-utils==0.16.2",
 ]
 
+[tool.pyrefly]
+project-includes = ["**/*.py*", "**/*.ipynb"]
+
 [dependency-groups]
-dev = ["confluent-kafka==2.15.0"]
+dev = []

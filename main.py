@@ -18,6 +18,7 @@ from anomaly import AnomalyStreamer
 from database import get_connection
 from database.connector import db_pool
 from history import StockTradeQuery, StockTradeRepository, StockTradeResponse
+from messaging import stock_trade_consumer
 from realtime import TickStreamer
 from realtime.model import RealtimeTickUpdate
 from stock_generator import run_stock_data_inserter
@@ -32,7 +33,15 @@ async def lifespan(_: FastAPI) -> AsyncGenerator[None, None]:
     await db_pool.create()
     logger.info("Database connection pool created successfully")
 
+    # Kafka 체결 데이터 consumer 시작 (브로커 구독 + 백그라운드 소비 루프)
+    await stock_trade_consumer.create()
+    logger.info("Kafka stock-trade consumer started successfully")
+
     yield
+
+    # 종료는 생성의 역순: consumer 를 먼저 정리한 뒤 DB 풀을 해제한다
+    await stock_trade_consumer.close()
+    logger.info("Kafka stock-trade consumer stopped successfully")
 
     # 애플리케이션 종료 시 데이터베이스 풀 해제
     await db_pool.close()
