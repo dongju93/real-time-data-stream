@@ -6,7 +6,7 @@ import asyncio
 import random
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from typing import Annotated, Literal, NoReturn
+from typing import Annotated, Literal
 
 import numpy as np
 from pydantic import BaseModel, Field, field_validator
@@ -384,55 +384,89 @@ class StockDataInserter:
         return inserted_count
 
 
-async def run_stock_data_inserter(
-    trade_transaction_per_second: int | None = None,
-) -> NoReturn:
-    """주식 데이터 생성 및 삽입 실행 - 설정 기반 동적 파라미터"""
+class StockDataGeneratorService:
+    """애플리케이션 lifespan이 소유하는 주식 데이터 생성 태스크."""
 
-    # 설정에서 기본값들 로드
-    if trade_transaction_per_second is None:
+    def __init__(self) -> None:
+        self._task: asyncio.Task[None] | None = None
+        self._stop = asyncio.Event()
+
+    def start(self) -> bool:
+        """생성 태스크를 한 번만 시작한다."""
+        if self._task is not None and not self._task.done():
+            return False
+
+        self._stop.clear()
+        self._task = asyncio.create_task(self._run(), name="stock-data-generator")
+        return True
+
+    async def stop(self) -> None:
+        """실행 중인 생성 태스크를 취소하고 종료될 때까지 기다린다."""
+        self._stop.set()
+        if self._task is None:
+            return
+
+        if not self._task.done():
+            self._task.cancel()
+        await asyncio.gather(self._task, return_exceptions=True)
+        self._task = None
+
+    async def _run(self) -> None:
+        """설정에 따라 주식 데이터를 생성하고 삽입한다."""
         trade_transaction_per_second = get_config(
             "stock_generator", "generation", "default_batch_size"
         )
+        min_batch_size = get_config("stock_generator", "generation", "min_batch_size")
+        max_batch_multiplier = get_config(
+            "stock_generator", "generation", "max_batch_multiplier"
+        )
+        distribution_seconds = get_config(
+            "stock_generator", "generation", "distribution_seconds"
+        )
 
-    min_batch_size = get_config("stock_generator", "generation", "min_batch_size")
-    max_batch_multiplier = get_config(
-        "stock_generator", "generation", "max_batch_multiplier"
-    )
-    distribution_seconds = get_config(
-        "stock_generator", "generation", "distribution_seconds"
-    )
+        generator = StockDataGenerator()
+        inserter = StockDataInserter()
 
-    # 설정 기반으로 generator와 inserter 생성 (ticker는 자동으로 config에서 로드됨)
-    generator = StockDataGenerator()
-    inserter = StockDataInserter()
+        logger.info(
+            f"📈 주식 데이터 생성기 시작 - 기본 배치 크기: "
+            f"{trade_transaction_per_second}, 최소: {min_batch_size}, "
+            f"최대 배수: {max_batch_multiplier}x, "
+            f"분산 시간: {distribution_seconds}초"
+        )
 
-    logger.info(
-        f"📈 주식 데이터 생성기 시작 - 기본 배치 크기: {trade_transaction_per_second}, "
-        f"최소: {min_batch_size}, 최대 배수: {max_batch_multiplier}x, "
-        f"분산 시간: {distribution_seconds}초"
-    )
-
-    while True:
         try:
-            # 설정 기반 랜덤 배치 크기 계산
-            min_size = min_batch_size
-            max_size = trade_transaction_per_second * max_batch_multiplier
-            random_batch_size = random.randint(min_size, max_size)
+            while not self._stop.is_set():
+                try:
+                    min_size = min_batch_size
+                    max_size = trade_transaction_per_second * max_batch_multiplier
+                    random_batch_size = random.randint(min_size, max_size)
 
-            logger.info(
-                f"🎲 랜덤 배치 크기 결정: {random_batch_size}개 (범위: {min_size}~{max_size})"
-            )
+                    logger.info(
+                        f"🎲 랜덤 배치 크기 결정: {random_batch_size}개 "
+                        f"(범위: {min_size}~{max_size})"
+                    )
 
-            # 설정된 시간 동안 분산 트레이드 데이터 생성 및 삽입
-            inserted_count = await inserter.generate_distributed_and_insert(
-                generator, trade_transaction_per_second=random_batch_size
-            )
-            logger.info(
-                f"📊 총 {inserted_count}건의 트레이드 데이터가 데이터베이스에 삽입되었습니다"
-            )
-        except Exception as e:
-            logger.error(f"❌ 데이터 삽입 중 오류 발생: {e}")
+                    inserted_count = await inserter.generate_distributed_and_insert(
+                        generator, trade_transaction_per_second=random_batch_size
+                    )
+                    logger.info(
+                        f"📊 총 {inserted_count}건의 트레이드 데이터가 "
+                        "데이터베이스에 삽입되었습니다"
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    logger.error(f"❌ 데이터 삽입 중 오류 발생: {e}")
 
-        # 설정된 시간만큼 대기 후 다음 배치 생성
-        await asyncio.sleep(distribution_seconds)
+                try:
+                    await asyncio.wait_for(
+                        self._stop.wait(), timeout=distribution_seconds
+                    )
+                except TimeoutError:
+                    pass
+        except asyncio.CancelledError:
+            logger.info("Stock data generator cancelled")
+            raise
+
+
+stock_data_generator = StockDataGeneratorService()

@@ -5,7 +5,6 @@ from typing import Annotated, Any
 
 from fastapi import (
     APIRouter,
-    BackgroundTasks,
     Depends,
     FastAPI,
     HTTPException,
@@ -21,7 +20,7 @@ from history import StockTradeQuery, StockTradeRepository, StockTradeResponse
 from messaging import stock_trade_consumer
 from realtime import TickStreamer
 from realtime.model import RealtimeTickUpdate
-from stock_generator import run_stock_data_inserter
+from stock_generator import stock_data_generator
 from utils import logger_instance, serialize_value
 
 logger = logger_instance()
@@ -39,7 +38,10 @@ async def lifespan(_: FastAPI) -> AsyncGenerator[None, None]:
 
     yield
 
-    # 종료는 생성의 역순: consumer 를 먼저 정리한 뒤 DB 풀을 해제한다
+    # 장수명 태스크를 먼저 중지한 뒤 해당 태스크가 사용하는 리소스를 정리한다
+    await stock_data_generator.stop()
+    logger.info("Stock data generator stopped successfully")
+
     await stock_trade_consumer.close()
     logger.info("Kafka stock-trade consumer stopped successfully")
 
@@ -73,18 +75,13 @@ async def fetch_stock_data() -> list[dict[str, Any]]:
 
 
 @stock_streamer_v1.post("/stock/generate", status_code=status.HTTP_202_ACCEPTED)
-async def generate_stock_data(background_tasks: BackgroundTasks) -> dict[str, str]:
-    """Generate stock data in the background.
-
-    Args:
-        background_tasks (BackgroundTasks): Background tasks manager.
-
-    Returns:
-        dict[str, str]: Status payload. The 202 status is declared on the route
-        decorator so the value can be returned directly.
-    """
-    background_tasks.add_task(run_stock_data_inserter)
-    return {"status": "success", "message": "Stock data generation started"}
+async def generate_stock_data() -> dict[str, str]:
+    """Start the lifespan-managed stock data generator."""
+    started = stock_data_generator.start()
+    return {
+        "status": "success",
+        "message": "started" if started else "already running",
+    }
 
 
 @stock_streamer_v1.get("/stock")
