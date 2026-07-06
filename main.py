@@ -1,10 +1,17 @@
 import asyncio
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
-from typing import Annotated
+from typing import Annotated, Any
 
-from fastapi import APIRouter, BackgroundTasks, Depends, FastAPI, status
-from fastapi.responses import ORJSONResponse, StreamingResponse
+from fastapi import (
+    APIRouter,
+    BackgroundTasks,
+    Depends,
+    FastAPI,
+    HTTPException,
+    status,
+)
+from fastapi.responses import StreamingResponse
 from fastapi.websockets import WebSocket, WebSocketDisconnect
 
 from anomaly import AnomalyStreamer
@@ -32,73 +39,67 @@ async def lifespan(_: FastAPI) -> AsyncGenerator[None, None]:
     logger.info("Database connection pool closed successfully")
 
 
-stock_streamer = FastAPI(default_response_class=ORJSONResponse, lifespan=lifespan)
+stock_streamer = FastAPI(lifespan=lifespan)
 
 stock_streamer_v1 = APIRouter(prefix="/api/v1")
 
 
 @stock_streamer_v1.get("/test")
-async def fetch_stock_data() -> ORJSONResponse:
+async def fetch_stock_data() -> list[dict[str, Any]]:
     """Fetch stock data from the database.
 
     Returns:
-        dict: A dictionary containing the fetched stock data.
+        list[dict[str, Any]]: The fetched stock records. FastAPI serializes this
+        directly to JSON via Pydantic (datetime/UUID/Decimal handled by the
+        encoder), so no explicit response class is needed.
     """
     async with get_connection() as conn:
         result = await conn.fetch("SELECT * FROM stock_trades LIMIT 10")
         logger.info("Fetched stock data successfully")
 
-        serialized_result: list[dict[str, str | int]] = [
+        return [
             {key: serialize_value(value) for key, value in dict(record).items()}
             for record in result
         ]
 
-        return ORJSONResponse(content=serialized_result, status_code=status.HTTP_200_OK)
 
-
-@stock_streamer_v1.post("/stock/generate")
-async def generate_stock_data(background_tasks: BackgroundTasks) -> ORJSONResponse:
+@stock_streamer_v1.post("/stock/generate", status_code=status.HTTP_202_ACCEPTED)
+async def generate_stock_data(background_tasks: BackgroundTasks) -> dict[str, str]:
     """Generate stock data in the background.
 
     Args:
         background_tasks (BackgroundTasks): Background tasks manager.
 
     Returns:
-        ORJSONResponse: Response indicating the status of the operation.
+        dict[str, str]: Status payload. The 202 status is declared on the route
+        decorator so the value can be returned directly.
     """
     background_tasks.add_task(run_stock_data_inserter)
-    return ORJSONResponse(
-        content={"status": "success", "message": "Stock data generation started"},
-        status_code=status.HTTP_202_ACCEPTED,
-    )
+    return {"status": "success", "message": "Stock data generation started"}
 
 
 @stock_streamer_v1.get("/stock")
 async def get_stock_trades(
     query: Annotated[StockTradeQuery, Depends()],
-) -> ORJSONResponse:
+) -> StockTradeResponse:
     """Fetch stock trades from the database with optional filters.
 
     Args:
         query: StockTradeQuery containing filter parameters
 
     Returns:
-        ORJSONResponse: List of filtered stock trades
+        StockTradeResponse: Filtered stock trades. Returning the model directly
+        lets FastAPI serialize it (and document it in the OpenAPI schema).
     """
     try:
-        result: StockTradeResponse = await StockTradeRepository.fetch_trades(query)
-
-        return ORJSONResponse(
-            content=result.model_dump(),
-            status_code=status.HTTP_200_OK,
-        )
+        return await StockTradeRepository.fetch_trades(query)
 
     except Exception as e:
         logger.error(f"Error fetching stock trades: {e}")
-        return ORJSONResponse(
-            content={"error": "Failed to fetch stock trades", "detail": str(e)},
+        raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-        )
+            detail="Failed to fetch stock trades",
+        ) from e
 
 
 # wss
