@@ -74,79 +74,58 @@ flowchart TD
 
 ## Local Docker Data Pipeline
 
-Docker Compose 설정은 `docker/data-pipeline/docker-compose.yaml`에 있다.
+`docker/data-pipeline/docker-compose.yaml` — PostgreSQL(TimescaleDB), Kafka, Debezium, Flink를 한 스택으로 띄운다.
+
+### 사전 준비
+
+`docker/data-pipeline/.env.compose.local` 생성:
+
+```
+POSTGRES_PASSWORD=<your-password>
+POSTGRES_DB=stock
+```
+
+`POSTGRES_USER`를 넣지 않으면 슈퍼유저는 `postgres`다.
+
+아래 파일의 사용자명·비밀번호를 위 `POSTGRES_PASSWORD`와 맞춘다.
+
+| 파일                                     | 넣을 값                                                                                         |
+| ---------------------------------------- | ----------------------------------------------------------------------------------------------- |
+| `postgres/init/02-cdc.sql`               | CDC용 replication role (예: `debezium`)                                                         |
+| `postgres/pg_hba.conf`                   | 위 role 이름 (replication 허용 줄)                                                              |
+| `debezium/postgres-stock-connector.json` | `database.*` → CDC role, `transforms.timescaledb.database.*` → `postgres` + `POSTGRES_PASSWORD` |
+
+`01-ddl.sql`, `02-cdc.sql`은 `postgres_data` volume이 처음 만들어질 때만 실행된다.
 
 ### 실행
 
 ```bash
 cd docker/data-pipeline
-docker compose down
 docker compose up -d
 ./debezium/register-connector.sh
 ```
 
-위 명령은 로컬 데이터 파이프라인 컨테이너를 내렸다가 다시 올린 뒤, Debezium connector 등록 스크립트를 별도로 실행한다. `down`은 컨테이너와 네트워크를 제거하지만 named volume은 제거하지 않는다.
+`register-connector.sh`는 `http://localhost:8083`에 `postgres-stock-connector.json`을 등록한다. Compose에 포함되지 않는다.
 
-### 포함된 실행 단위
+### 구성
 
-| 이름               | 역할                          | 계속 떠 있어야 하는지 |
-| ------------------ | ----------------------------- | --------------------- |
-| `postgres-stock`   | TimescaleDB/PostgreSQL 저장소 | 예                    |
-| `broker`           | Kafka broker/controller       | 예                    |
-| `debezium-connect` | Debezium Kafka Connect worker | 예                    |
-| `jobmanager`       | Flink JobManager              | 예                    |
-| `taskmanager`      | Flink TaskManager             | 예                    |
-| `kafka-ui`         | Kafka UI                      | 예                    |
+| 서비스             | 역할                                            | 호스트 포트 |
+| ------------------ | ----------------------------------------------- | ----------- |
+| `postgres-stock`   | TimescaleDB, `01-ddl.sql`·`02-cdc.sql`로 초기화 | 5432        |
+| `broker`           | Kafka (KRaft)                                   | 9094        |
+| `debezium-connect` | PostgreSQL CDC → Kafka                          | 8083        |
+| `kafka-ui`         | Kafka UI                                        | 8080        |
+| `jobmanager`       | Flink JobManager                                | 8081        |
+| `taskmanager`      | Flink TaskManager                               | —           |
 
-Debezium connector 등록은 Compose 서비스로 실행하지 않는다. Compose로 `debezium-connect`까지 올린 뒤, 호스트에서 `docker/data-pipeline/debezium/register-connector.sh`를 별도로 실행한다.
+네트워크 `stock_trade_network`. 데이터는 `postgres_data`, `kafka_data` volume에 저장된다.
 
-동작 순서:
+### 접속
 
-1. `docker compose up -d`로 `postgres-stock`, `broker`, `debezium-connect`를 올린다.
-2. `./debezium/register-connector.sh`를 실행한다.
-3. 스크립트가 `debezium-connect` REST API가 준비될 때까지 기다린다.
-4. `docker/data-pipeline/debezium/postgres-stock-connector.json`을 `POST /connectors/`로 전송한다.
-5. 등록 성공이면 종료한다.
-6. 이미 등록되어 있으면 정상으로 보고 종료한다.
-
-### 데이터 유지 기준
-
-| 대상                                          | 저장 위치                         | 재실행 후 유지 |
-| --------------------------------------------- | --------------------------------- | -------------- |
-| PostgreSQL 데이터                             | `postgres_data` named volume      | 유지           |
-| Kafka 데이터/topic/offset                     | `kafka_data` named volume         | 유지           |
-| Debezium connector config/offset/status topic | Kafka의 `kafka_data` named volume | 등록 후 유지   |
-
-데이터를 유지하려면 `docker compose down -v`를 사용하지 않는다. `-v`는 named volume까지 삭제하므로 PostgreSQL/Kafka 데이터를 초기화한다.
-
-### 최초 실행과 재실행 차이
-
-- 최초 실행: `postgres_data`, `kafka_data` volume이 생성되고 PostgreSQL init SQL이 실행된다.
-- 재실행: 기존 volume을 재사용하므로 데이터가 유지된다.
-- PostgreSQL init SQL은 Docker entrypoint 동작상 `postgres_data`가 처음 생성될 때만 실행된다.
-
-PostgreSQL 초기화에 연결된 SQL:
-
-- `docker/data-pipeline/postgres/init/01-ddl.sql`
-- `docker/data-pipeline/postgres/init/02-cdc.sql`
-
-수동 점검용 SQL:
-
-- `docker/data-pipeline/postgres/checks/connection_check.sql`
-
-Debezium connector 등록 JSON:
-
-- `docker/data-pipeline/debezium/postgres-stock-connector.json`
-
-Flink Kafka connector JAR:
-
-- `docker/data-pipeline/flink/connectors/flink-sql-connector-kafka-4.0.0-2.0.jar`
-
-### 접속 기준
-
-- 호스트에서 실행되는 애플리케이션은 Kafka `localhost:9094`, PostgreSQL `localhost:5432`로 접속한다.
-- Compose 내부 컨테이너끼리는 Kafka `broker:9092`, PostgreSQL `postgres-stock:5432`로 접속한다.
-- Debezium CDC topic은 `stock.public.stock_trades`이다.
+|            | 호스트에서 실행  | Compose 내부          |
+| ---------- | ---------------- | --------------------- |
+| PostgreSQL | `localhost:5432` | `postgres-stock:5432` |
+| Kafka      | `localhost:9094` | `broker:9092`         |
 
 ## 구현 기술 상세
 
