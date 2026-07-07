@@ -6,9 +6,14 @@
 얻는다(개발 항목 #1 의 "confluent-kafka + executor" 방식을 라이브러리가 대신 수행).
 
 `DatabasePool.create()/close()` 패턴을 그대로 따르되, DB 풀과 달리 백그라운드
-소비 루프(`asyncio.Task`)를 함께 소유한다. 이 모듈은 브로커 연결·수신을 로그로
-확인하는 데까지만 책임진다(#1 완료 기준). 메시지 파싱(#2)·ticker 라우팅(#3)은
-후속 항목에서 이 소비 루프 위에 얹는다.
+소비 루프(`asyncio.Task`)를 함께 소유한다. 소비 루프는 수신 확인(#1) 위에
+Debezium envelope → 도메인 이벤트(`CdcTradeEvent`) 파싱(#2)을 얹은 상태로,
+배치 단위 요약만 로깅한다. 파싱된 이벤트를 ticker 별로 fan-out 하는
+라우팅(#3)은 후속 항목에서 `_process_batch` 의 반환값 위에 얹는다.
+
+파싱 로직은 도메인 모델과 함께 `realtime.model` 에 있다(#2 명세). 의존은
+messaging → realtime.model 단방향으로 유지하고, 역방향 결합이 필요해지는
+#3 은 main.py(조립 지점)에서 두 모듈을 연결해 순환 임포트를 피한다.
 """
 
 import asyncio
@@ -16,6 +21,7 @@ import asyncio
 from confluent_kafka import KafkaError, Message
 from confluent_kafka.aio import AIOConsumer
 
+from realtime.model import CdcMessageParseError, CdcTradeEvent, parse_cdc_message
 from utils.logger import logger_instance
 
 from .config import KafkaSettings, load_kafka_settings
@@ -42,7 +48,11 @@ class StockTradeConsumer:
         self._settings: KafkaSettings | None = settings
         self._consumer: AIOConsumer | None = None
         self._consume_task: asyncio.Task[None] | None = None
+        # 운영 카운터(#18 의 기초): 수신·파싱 성공·정책상 무시·파싱 실패 누계.
         self._message_count: int = 0
+        self._parsed_count: int = 0
+        self._skipped_count: int = 0
+        self._parse_failure_count: int = 0
 
     async def create(self) -> None:
         """AIOConsumer 를 생성·구독하고 백그라운드 소비 루프를 시작한다.
@@ -84,7 +94,10 @@ class StockTradeConsumer:
             self._consumer = None
 
         logger.info(
-            f"Kafka consumer closed (total messages consumed: {self._message_count})"
+            "Kafka consumer closed "
+            f"(consumed={self._message_count}, parsed={self._parsed_count}, "
+            f"skipped={self._skipped_count}, "
+            f"parse_failures={self._parse_failure_count})"
         )
 
     async def _consume_loop(self) -> None:
@@ -104,7 +117,9 @@ class StockTradeConsumer:
                 trades = [msg for msg in messages if self._is_trade_message(msg)]
                 if trades:
                     self._message_count += len(trades)
-                    self._log_batch(trades)
+                    # 반환된 이벤트는 fan-out 라우팅(#3)이 생기기 전까지는
+                    # 소비 지점이 없어 여기서 버려진다.
+                    self._process_batch(trades)
         except asyncio.CancelledError:
             logger.info("Kafka consume loop cancelled")
             raise
@@ -114,8 +129,8 @@ class StockTradeConsumer:
     def _is_trade_message(self, message: Message) -> bool:
         """유효한 체결 메시지면 True, 에러/파티션 끝이면 False.
 
-        #1 범위에서는 데이터 payload 를 파싱하지 않고 수신 여부만 판별한다.
-        Debezium envelope 파싱→도메인 이벤트 변환은 #2 에서 얹는다.
+        여기서는 Kafka 수준의 수신 유효성만 판별한다. payload 해석은
+        `_process_batch` 가 호출하는 `parse_cdc_message`(#2)의 몫이다.
         """
         error: KafkaError | None = message.error()
         if error is None:
@@ -125,22 +140,55 @@ class StockTradeConsumer:
             logger.warning(f"Kafka message error: {error.str()}")
         return False
 
-    def _log_batch(self, trades: list[Message]) -> None:
-        """배치 단위 요약 로깅.
+    def _process_batch(self, trades: list[Message]) -> list[CdcTradeEvent]:
+        """배치를 Debezium envelope → 도메인 이벤트로 변환하고 요약 로깅한다(#2).
 
-        초당 수천 건에서도 로그가 폭주하지 않도록 배치당 한 줄만 남기고,
-        마지막 메시지의 오프셋과 payload 앞부분만 샘플로 보여준다(#1 수신 확인).
+        파싱 실패는 배치를 멈추지 않는다 — 실패는 건수로 세고 마지막 오류만
+        경고 한 줄로 남긴다(초당 수천 건 환경의 배치당 1줄 로깅 규약).
+        반환값(검증된 이벤트 리스트)이 #3 ticker 라우팅의 입력이 된다.
         """
-        sample_message = trades[-1]
-        raw_value: bytes | None = sample_message.value()
+        events: list[CdcTradeEvent] = []
+        skipped = 0
+        failed = 0
+        last_error: CdcMessageParseError | None = None
+
+        for message in trades:
+            raw_value: bytes | None = message.value()
+            try:
+                event = parse_cdc_message(raw_value)
+            except CdcMessageParseError as e:
+                failed += 1
+                last_error = e
+                continue
+            if event is None:
+                # tombstone 이거나 u/d 등 정책상 무시하는 op(#2 정책).
+                skipped += 1
+            else:
+                events.append(event)
+
+        self._parsed_count += len(events)
+        self._skipped_count += skipped
+        self._parse_failure_count += failed
+
+        last_message = trades[-1]
         sample = (
-            raw_value[:120].decode("utf-8", errors="replace") if raw_value else None
+            f"{events[-1].ticker} {events[-1].trade_type} "
+            f"{events[-1].volume}@{events[-1].price}"
+            if events
+            else None
         )
         logger.info(
-            f"Consumed {len(trades)} stock trades (total={self._message_count}) "
-            f"[partition={sample_message.partition()} offset={sample_message.offset()}] "
+            f"Consumed {len(trades)} CDC messages "
+            f"(parsed={len(events)}, skipped={skipped}, failed={failed}, "
+            f"total_parsed={self._parsed_count}) "
+            f"[partition={last_message.partition()} offset={last_message.offset()}] "
             f"sample={sample}"
         )
+        if last_error is not None:
+            logger.warning(
+                f"CDC parse failures in batch: {failed} (last error: {last_error})"
+            )
+        return events
 
 
 # 앱 전역에서 공유하는 단일 consumer 인스턴스(db_pool 과 동일한 싱글턴 패턴).
