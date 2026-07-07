@@ -72,6 +72,82 @@ flowchart TD
 2. 저장된 거래내역은 Change Data Capture 를 통해 Kafka 로 스트리밍된다
 3. Flink 에서는 거래내역을 실시간으로 통계 및 연산을 수행하여 이상 거래 여부를 판단한다
 
+## Local Docker Data Pipeline
+
+Docker Compose 설정은 `docker/data-pipeline/docker-compose.yaml`에 있다.
+
+### 실행
+
+```bash
+cd docker/data-pipeline
+docker compose down
+docker compose up -d
+./debezium/register-connector.sh
+```
+
+위 명령은 로컬 데이터 파이프라인 컨테이너를 내렸다가 다시 올린 뒤, Debezium connector 등록 스크립트를 별도로 실행한다. `down`은 컨테이너와 네트워크를 제거하지만 named volume은 제거하지 않는다.
+
+### 포함된 실행 단위
+
+| 이름               | 역할                          | 계속 떠 있어야 하는지 |
+| ------------------ | ----------------------------- | --------------------- |
+| `postgres-stock`   | TimescaleDB/PostgreSQL 저장소 | 예                    |
+| `broker`           | Kafka broker/controller       | 예                    |
+| `debezium-connect` | Debezium Kafka Connect worker | 예                    |
+| `jobmanager`       | Flink JobManager              | 예                    |
+| `taskmanager`      | Flink TaskManager             | 예                    |
+| `kafka-ui`         | Kafka UI                      | 예                    |
+
+Debezium connector 등록은 Compose 서비스로 실행하지 않는다. Compose로 `debezium-connect`까지 올린 뒤, 호스트에서 `docker/data-pipeline/debezium/register-connector.sh`를 별도로 실행한다.
+
+동작 순서:
+
+1. `docker compose up -d`로 `postgres-stock`, `broker`, `debezium-connect`를 올린다.
+2. `./debezium/register-connector.sh`를 실행한다.
+3. 스크립트가 `debezium-connect` REST API가 준비될 때까지 기다린다.
+4. `docker/data-pipeline/debezium/postgres-stock-connector.json`을 `POST /connectors/`로 전송한다.
+5. 등록 성공이면 종료한다.
+6. 이미 등록되어 있으면 정상으로 보고 종료한다.
+
+### 데이터 유지 기준
+
+| 대상                                          | 저장 위치                         | 재실행 후 유지 |
+| --------------------------------------------- | --------------------------------- | -------------- |
+| PostgreSQL 데이터                             | `postgres_data` named volume      | 유지           |
+| Kafka 데이터/topic/offset                     | `kafka_data` named volume         | 유지           |
+| Debezium connector config/offset/status topic | Kafka의 `kafka_data` named volume | 등록 후 유지   |
+
+데이터를 유지하려면 `docker compose down -v`를 사용하지 않는다. `-v`는 named volume까지 삭제하므로 PostgreSQL/Kafka 데이터를 초기화한다.
+
+### 최초 실행과 재실행 차이
+
+- 최초 실행: `postgres_data`, `kafka_data` volume이 생성되고 PostgreSQL init SQL이 실행된다.
+- 재실행: 기존 volume을 재사용하므로 데이터가 유지된다.
+- PostgreSQL init SQL은 Docker entrypoint 동작상 `postgres_data`가 처음 생성될 때만 실행된다.
+
+PostgreSQL 초기화에 연결된 SQL:
+
+- `docker/data-pipeline/postgres/init/01-ddl.sql`
+- `docker/data-pipeline/postgres/init/02-cdc.sql`
+
+수동 점검용 SQL:
+
+- `docker/data-pipeline/postgres/checks/connection_check.sql`
+
+Debezium connector 등록 JSON:
+
+- `docker/data-pipeline/debezium/postgres-stock-connector.json`
+
+Flink Kafka connector JAR:
+
+- `docker/data-pipeline/flink/connectors/flink-sql-connector-kafka-4.0.0-2.0.jar`
+
+### 접속 기준
+
+- 호스트에서 실행되는 애플리케이션은 Kafka `localhost:9094`, PostgreSQL `localhost:5432`로 접속한다.
+- Compose 내부 컨테이너끼리는 Kafka `broker:9092`, PostgreSQL `postgres-stock:5432`로 접속한다.
+- Debezium CDC topic은 `stock.public.stock_trades`이다.
+
 ## 구현 기술 상세
 
 ### TimescaleDB: 시계열 데이터베이스 최적화
@@ -82,7 +158,7 @@ flowchart TD
 ### Debezium & Kafka: 변경 데이터 캡처(CDC) 및 이벤트 스트리밍
 
 - **CDC 설정**: Debezium PostgreSQL 커넥터가 `stock_trades` 테이블의 변경 사항을 실시간으로 감지합니다. `publication.name`으로 `dbz_publication`을 사용하여 논리적 디코딩(Logical Decoding)을 통해 변경분을 스트림으로 변환합니다.
-- **Kafka 토픽**: 감지된 모든 데이터 변경(INSERT, UPDATE, DELETE) 이벤트는 `stock.stock_trades`라는 Kafka 토픽으로 발행(Publish)됩니다. 이 토픽은 실시간 데이터 파이프라인의 중심 허브 역할을 합니다.
+- **Kafka 토픽**: 감지된 모든 데이터 변경(INSERT, UPDATE, DELETE) 이벤트는 `stock.public.stock_trades`라는 Kafka 토픽으로 발행(Publish)됩니다. 이 토픽은 실시간 데이터 파이프라인의 중심 허브 역할을 합니다.
 - **느슨한 결합**: 이 아키텍처를 통해 데이터베이스와 실시간 처리 시스템(FastAPI, Flink)이 분리됩니다. 데이터베이스는 데이터 저장에만 집중하고, 실시간 처리가 필요한 모든 애플리케이션은 Kafka 토픽을 구독(Subscribe)하여 독립적으로 확장 및 운영될 수 있습니다.
 
 ## API
