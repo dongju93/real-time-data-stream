@@ -7,16 +7,18 @@
 
 `DatabasePool.create()/close()` 패턴을 그대로 따르되, DB 풀과 달리 백그라운드
 소비 루프(`asyncio.Task`)를 함께 소유한다. 소비 루프는 수신 확인(#1) 위에
-Debezium envelope → 도메인 이벤트(`CdcTradeEvent`) 파싱(#2)을 얹은 상태로,
-배치 단위 요약만 로깅한다. 파싱된 이벤트를 ticker 별로 fan-out 하는
-라우팅(#3)은 후속 항목에서 `_process_batch` 의 반환값 위에 얹는다.
+Debezium envelope → 도메인 이벤트(`CdcTradeEvent`) 파싱(#2)을 얹고, 파싱된
+이벤트 배치를 등록된 핸들러(#3 fan-out 라우터)로 넘긴다. 배치 단위 요약만 로깅한다.
 
 파싱 로직은 도메인 모델과 함께 `realtime.model` 에 있다(#2 명세). 의존은
-messaging → realtime.model 단방향으로 유지하고, 역방향 결합이 필요해지는
-#3 은 main.py(조립 지점)에서 두 모듈을 연결해 순환 임포트를 피한다.
+messaging → realtime.model 단방향으로 유지한다. #3 의 fan-out 라우터는 여기서
+직접 임포트하지 않고 `set_event_handler()` 콜백 seam 으로 주입받아, main.py
+(조립 지점)가 `stock_trade_consumer.set_event_handler(ticker_router.route)` 로
+연결하게 한다 — 역방향 결합을 조립 지점에 몰아 순환 임포트를 피한다.
 """
 
 import asyncio
+from collections.abc import Callable
 
 from confluent_kafka import KafkaError, Message
 from confluent_kafka.aio import AIOConsumer
@@ -48,11 +50,25 @@ class StockTradeConsumer:
         self._settings: KafkaSettings | None = settings
         self._consumer: AIOConsumer | None = None
         self._consume_task: asyncio.Task[None] | None = None
+        # 파싱된 CDC 이벤트 배치를 받을 핸들러(#3 fan-out 라우터 연결점).
+        # main.py 가 set_event_handler() 로 주입한다. 미설정이면 이벤트는 버려진다.
+        self._on_events: Callable[[list[CdcTradeEvent]], None] | None = None
         # 운영 카운터(#18 의 기초): 수신·파싱 성공·정책상 무시·파싱 실패 누계.
         self._message_count: int = 0
         self._parsed_count: int = 0
         self._skipped_count: int = 0
         self._parse_failure_count: int = 0
+
+    def set_event_handler(
+        self, handler: Callable[[list[CdcTradeEvent]], None] | None
+    ) -> None:
+        """파싱된 CDC 이벤트 배치를 받을 콜백을 등록한다(#3 fan-out 라우터 연결점).
+
+        핸들러는 소비 루프(이벤트 루프 스레드)에서 **동기·논블로킹**으로 호출되므로
+        여기서 블로킹하면 전체 소비가 멈춘다. `ticker_router.route` 가 이 계약을
+        만족한다. `create()` 전후 언제든 호출 가능하다.
+        """
+        self._on_events = handler
 
     async def create(self) -> None:
         """AIOConsumer 를 생성·구독하고 백그라운드 소비 루프를 시작한다.
@@ -117,9 +133,17 @@ class StockTradeConsumer:
                 trades = [msg for msg in messages if self._is_trade_message(msg)]
                 if trades:
                     self._message_count += len(trades)
-                    # 반환된 이벤트는 fan-out 라우팅(#3)이 생기기 전까지는
-                    # 소비 지점이 없어 여기서 버려진다.
-                    self._process_batch(trades)
+                    events = self._process_batch(trades)
+                    # fan-out 라우팅(#3): 파싱된 이벤트를 ticker 별 구독자에게
+                    # 분배한다. 핸들러 오류가 소비 루프를 죽이지 않도록 격리한다.
+                    if events and self._on_events is not None:
+                        try:
+                            self._on_events(events)
+                        except Exception as e:
+                            logger.error(
+                                f"Event fan-out handler failed "
+                                f"for {len(events)} events: {e}"
+                            )
         except asyncio.CancelledError:
             logger.info("Kafka consume loop cancelled")
             raise

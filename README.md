@@ -169,7 +169,7 @@ docker compose up -d
 
 - [x] #1 Kafka consumer 를 애플리케이션 런타임 의존성으로 반영
 - [x] #2 Debezium CDC 메시지 스키마 파싱 로직 구현
-- [ ] #3 WebSocket 연결별 ticker / tick 상태 관리
+- [x] #3 WebSocket 연결별 ticker / tick 상태 관리
 - [ ] #4 수신 이벤트를 tick 주기 기준 candle / high-low 로 집계
 - [ ] #5 ticker 변경 시 기존 구독 해제 후 신규 구독 연결
 - [ ] #6 데이터 부재 / 지연 / consumer 오류 WebSocket 예외 처리
