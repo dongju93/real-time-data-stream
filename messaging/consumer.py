@@ -45,11 +45,16 @@ class FatalConsumerError(RuntimeError):
 
 
 class StockTradeConsumer:
-    """`stock.public.stock_trades` 토픽을 소비하는 공유 consumer.
+    """`stock.public.stock_trades` 토픽을 소비하는 **프로세스 내** 공유 consumer.
 
-    전 ticker 를 하나의 consumer 로 읽어들이는 구조로, 향후 연결별 fan-out
-    라우팅(#3)의 기반이 된다. 연결마다 consumer 를 만드는 대신 공유 1개를 두어
-    1,000 동시연결(성능요구 #1)에서도 브로커 부담을 낮춘다.
+    전 ticker 를 하나의 consumer 로 읽어들이는 구조로, 연결별 fan-out
+    라우팅(#3)의 기반이 된다. 연결마다 consumer 를 만드는 대신 프로세스당
+    공유 1개를 두어 1,000 동시연결(성능요구 #1)에서도 브로커 부담을 낮춘다.
+
+    multi-worker/replica 환경에서는 각 프로세스가 독립 consumer group 을 쓴다
+    (`messaging.config.fanout_instance_group_id`). 동일 group 을 공유하면 Kafka 가
+    파티션을 프로세스 간에 분할 할당해 로컬 `ticker_router` 구독자가 일부 체결을
+    놓친다. 프로세스마다 전체 토픽을 받고, 프로세스 안에서만 ticker 로 분배한다.
     """
 
     def __init__(self, settings: KafkaSettings | None = None) -> None:

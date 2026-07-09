@@ -5,8 +5,13 @@
 
 **핵심 설계 결정**(개발 항목 #3): 연결마다 전용 consumer 를 두면 1,000 동시연결 =
 1,000 consumer 로 브로커 부담(그룹 멤버·리밸런싱·TCP)이 폭증한다(성능요구 #1).
-그래서 '공유 consumer 1개 + 프로세스 내 fan-out 라우팅'을 택했다 — 이벤트당 비용은
-`O(해당 ticker 구독자 수)` 이고 브로커는 관여하지 않는다.
+그래서 '프로세스당 공유 consumer 1개 + 프로세스 내 fan-out 라우팅'을 택했다 —
+이벤트당 비용은 `O(해당 ticker 구독자 수)` 이고 브로커는 관여하지 않는다.
+
+multi-worker 시 각 프로세스 consumer 는 **서로 다른 group_id** 로 토픽 전체를
+받는다(`messaging.config.fanout_instance_group_id`). 같은 group 이면 파티션
+로드밸런싱으로 이 라우터가 일부 체결을 영원히 못 받는다. 프로세스 간 브로드캐스트
+계층(Redis 등)이 없으므로 인스턴스별 독립 소비가 전제다.
 
 **의존 방향**: consumer 는 이 모듈을 임포트하지 않는다. main.py(조립 지점)가
 `stock_trade_consumer.set_event_handler(ticker_router.route)` 로 messaging → realtime
