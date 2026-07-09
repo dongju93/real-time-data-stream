@@ -20,7 +20,7 @@ messaging → realtime.model 단방향으로 유지한다. #3 의 fan-out 라우
 import asyncio
 from collections.abc import Callable
 
-from confluent_kafka import KafkaError, Message
+from confluent_kafka import KafkaError, KafkaException, Message
 from confluent_kafka.aio import AIOConsumer
 
 from realtime.model import CdcMessageParseError, CdcTradeEvent, parse_cdc_message
@@ -35,6 +35,13 @@ logger = logger_instance()
 # 취소 신호에 응답하도록 하는 상한(초).
 _CONSUME_BATCH_SIZE = 500
 _CONSUME_TIMEOUT_SECONDS = 1.0
+_CONSUME_INITIAL_BACKOFF_SECONDS = 0.5
+_CONSUME_MAX_BACKOFF_SECONDS = 10.0
+_CONSUME_FATAL_ERROR_THRESHOLD = 5
+
+
+class FatalConsumerError(RuntimeError):
+    """복구 불가능한 Kafka consumer 오류."""
 
 
 class StockTradeConsumer:
@@ -58,6 +65,11 @@ class StockTradeConsumer:
         self._parsed_count: int = 0
         self._skipped_count: int = 0
         self._parse_failure_count: int = 0
+        self._consume_error_count: int = 0
+        self._recovering: bool = False
+        self._fatal_error: BaseException | None = None
+        self._started_at: float | None = None
+        self._last_message_at: float | None = None
 
     def set_event_handler(
         self, handler: Callable[[list[CdcTradeEvent]], None] | None
@@ -70,6 +82,25 @@ class StockTradeConsumer:
         """
         self._on_events = handler
 
+    def raise_if_fatal(self) -> None:
+        """치명 consumer 오류가 있으면 WS 계층으로 전파할 예외를 발생시킨다."""
+        fatal_error = self._fatal_error
+        if fatal_error is not None:
+            raise FatalConsumerError(
+                "Kafka stock-trade consumer is in fatal state"
+            ) from fatal_error
+
+    def is_stale(self, max_age_seconds: float) -> bool:
+        """consumer 가 복구 중이거나 일정 시간 새 Kafka 메시지를 못 받았는지 반환한다."""
+        if self._consumer is None:
+            return True
+        if self._recovering:
+            return True
+        last_seen_at = self._last_message_at or self._started_at
+        if last_seen_at is None:
+            return False
+        return asyncio.get_running_loop().time() - last_seen_at >= max_age_seconds
+
     async def create(self) -> None:
         """AIOConsumer 를 생성·구독하고 백그라운드 소비 루프를 시작한다.
 
@@ -78,6 +109,12 @@ class StockTradeConsumer:
         """
         if self._consumer is not None:
             return
+
+        self._fatal_error = None
+        self._recovering = False
+        self._consume_error_count = 0
+        self._started_at = asyncio.get_running_loop().time()
+        self._last_message_at = None
 
         settings = self._settings or load_kafka_settings()
         self._settings = settings
@@ -108,12 +145,14 @@ class StockTradeConsumer:
             # 오프셋 커밋 flush 및 group leave 를 포함한 정상 종료.
             await self._consumer.close()
             self._consumer = None
+        self._recovering = False
 
         logger.info(
             "Kafka consumer closed "
             f"(consumed={self._message_count}, parsed={self._parsed_count}, "
             f"skipped={self._skipped_count}, "
-            f"parse_failures={self._parse_failure_count})"
+            f"parse_failures={self._parse_failure_count}, "
+            f"consume_errors={self._consume_error_count})"
         )
 
     async def _consume_loop(self) -> None:
@@ -124,12 +163,21 @@ class StockTradeConsumer:
         """
         assert self._consumer is not None
 
-        try:
-            while True:
+        consecutive_errors = 0
+        backoff = _CONSUME_INITIAL_BACKOFF_SECONDS
+
+        while True:
+            try:
                 messages: list[Message] = await self._consumer.consume(
                     num_messages=_CONSUME_BATCH_SIZE,
                     timeout=_CONSUME_TIMEOUT_SECONDS,
                 )
+                consecutive_errors = 0
+                backoff = _CONSUME_INITIAL_BACKOFF_SECONDS
+                self._recovering = False
+                if messages:
+                    self._last_message_at = asyncio.get_running_loop().time()
+
                 trades = [msg for msg in messages if self._is_trade_message(msg)]
                 if trades:
                     self._message_count += len(trades)
@@ -144,11 +192,48 @@ class StockTradeConsumer:
                                 f"Event fan-out handler failed "
                                 f"for {len(events)} events: {e}"
                             )
-        except asyncio.CancelledError:
-            logger.info("Kafka consume loop cancelled")
-            raise
-        except Exception as e:
-            logger.error(f"Kafka consume loop error: {e}")
+
+            except asyncio.CancelledError:
+                logger.info("Kafka consume loop cancelled")
+                raise
+            except Exception as e:
+                consecutive_errors += 1
+                self._consume_error_count += 1
+                self._recovering = True
+
+                if (
+                    self._is_fatal_consume_error(e)
+                    or consecutive_errors >= _CONSUME_FATAL_ERROR_THRESHOLD
+                ):
+                    self._fatal_error = e
+                    logger.error(
+                        f"Kafka consume loop fatal error after "
+                        f"{consecutive_errors} consecutive failures: {e}"
+                    )
+                    raise
+
+                logger.warning(
+                    f"Kafka consume loop error; retrying in {backoff:.1f}s "
+                    f"(consecutive_failures={consecutive_errors}): {e}"
+                )
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, _CONSUME_MAX_BACKOFF_SECONDS)
+
+    def _is_fatal_consume_error(self, error: Exception) -> bool:
+        """Kafka 가 fatal 로 표시한 오류와 내부 fatal 오류를 판별한다."""
+        if isinstance(error, FatalConsumerError):
+            return True
+        if isinstance(error, KafkaError):
+            return self._is_fatal_kafka_error(error)
+        if isinstance(error, KafkaException) and error.args:
+            kafka_error = error.args[0]
+            if isinstance(kafka_error, KafkaError):
+                return self._is_fatal_kafka_error(kafka_error)
+        return False
+
+    def _is_fatal_kafka_error(self, error: KafkaError) -> bool:
+        fatal = getattr(error, "fatal", None)
+        return bool(fatal()) if callable(fatal) else False
 
     def _is_trade_message(self, message: Message) -> bool:
         """유효한 체결 메시지면 True, 에러/파티션 끝이면 False.
@@ -159,6 +244,8 @@ class StockTradeConsumer:
         error: KafkaError | None = message.error()
         if error is None:
             return True
+        if self._is_fatal_kafka_error(error):
+            raise FatalConsumerError(f"Fatal Kafka message error: {error.str()}")
         # 파티션 끝 도달은 정상 상황(에러 아님)이라 조용히 넘긴다.
         if error.code() != KafkaError._PARTITION_EOF:
             logger.warning(f"Kafka message error: {error.str()}")

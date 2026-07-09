@@ -132,7 +132,13 @@ async def stream_realtime_stock_data(websocket: WebSocket) -> None:
 
     # 연결 상태 소유자를 try 밖에서 만들어(생성 시 라우터 구독) finally 가 항상
     # 구독을 해제할 수 있게 한다 — 연결 누수/유령 구독 방지.
-    tick_streamer = TickStreamer(ticker, tick, websocket)
+    tick_streamer = TickStreamer(
+        ticker,
+        tick,
+        websocket,
+        consumer_health_check=stock_trade_consumer.raise_if_fatal,
+        consumer_stale_check=stock_trade_consumer.is_stale,
+    )
 
     try:
         logger.info(f"Starting real-time stream for {ticker} with {tick}s tick")

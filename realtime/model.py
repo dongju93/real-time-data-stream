@@ -34,11 +34,16 @@ class TickData(TypedDict):
     volume: int
 
 
+type TickStreamStatus = Literal["ok", "empty", "stale"]
+
+
 class TradeHighAndLow(TypedDict):
     type: Literal["candle_tick"]
     ticker: str
     data: TickData | None
     current_tick: int
+    status: TickStreamStatus
+    stale: bool
 
 
 class RealtimeTickUpdate(BaseModel):
