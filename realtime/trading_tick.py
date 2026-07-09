@@ -6,8 +6,8 @@
 를 요청한 두 연결은 각자 자기 구독의 이벤트만 받으므로 올바른 데이터만 수신한다.
 
 집계는 tick 윈도우 안에서 수신한 체결 이벤트의 open/high/low/close/volume 을
-계산한다(#4). 데이터 부재 시 직전 종가 유지 정책은 #6 에서, ticker 전환 시 유실/
-중복 최소화는 #5 에서 확장한다.
+계산한다(#4). ticker 전환 시 기존 구독을 해제하고 새 구독으로 전환하며(#5),
+데이터 부재 시 직전 종가 유지 정책은 #6 에서 확장한다.
 """
 
 import asyncio
@@ -84,6 +84,7 @@ class TickStreamer:
         self._subscription: Subscription = ticker_router.subscribe(ticker)
         self._bucket: _TickBucket = _TickBucket()
         self._last_sent_at: float | None = None
+        self._state_changed: asyncio.Event = asyncio.Event()
 
     def close(self) -> None:
         """연결 종료 시 라우터 구독을 해제한다(동기, 중복 호출 무해)."""
@@ -97,17 +98,23 @@ class TickStreamer:
 
         ticker 가 바뀌면 새 구독을 먼저 만든 뒤 이전 구독을 해제하고 진행 중
         버킷을 비운다(이전 ticker 가격이 새 캔들에 섞이지 않도록). tick 만 바뀌면
-        구독은 유지하고 집계 주기만 갱신한다(불필요한 재구독 방지). 전환 시 유실/
-        중복 최소화 등 정교한 처리는 #5 의 몫이다.
+        구독은 유지하고 집계 주기만 갱신한다(불필요한 재구독 방지).
         """
-        if ticker != self.ticker:
+        ticker_changed = ticker != self.ticker
+        tick_changed = tick != self.tick
+        if not (ticker_changed or tick_changed):
+            return
+
+        if ticker_changed:
+            old_ticker = self.ticker
             old = self._subscription
             self._subscription = ticker_router.subscribe(ticker)
             ticker_router.unsubscribe(old)
             self._bucket.reset()
-            logger.info(f"ticker switched: {self.ticker} -> {ticker}")
+            logger.info(f"ticker switched: {old_ticker} -> {ticker}")
         self.ticker = ticker
         self.tick = tick
+        self._state_changed.set()
 
     async def listen_for_tick_updates(self) -> None:
         """클라이언트가 보내는 ticker/tick 갱신을 수신해 상태에 반영한다."""
@@ -147,9 +154,9 @@ class TickStreamer:
         """구독 이벤트를 tick 윈도우로 묶어 캔들을 전송한다.
 
         각 윈도우 시작에서 현재 상태(구독/tick)를 스냅샷하고, 마감 시각까지 도착
-        하는 이벤트의 가격/거래량으로 OHLCV 를 집계한 뒤 경계에서 flush 한다. 구독을
-        윈도우 시작 시점에 고정하므로, 도중 ticker 가 바뀌어도 이번 윈도우가 다른
-        ticker 이벤트를 섞어 받지 않는다(다음 윈도우부터 새 구독 사용).
+        하는 이벤트의 가격/거래량으로 OHLCV 를 집계한 뒤 경계에서 flush 한다. 상태
+        변경 이벤트를 함께 기다리므로 ticker 전환 시 기존 구독 대기를 즉시 중단하고
+        새 구독 윈도우로 넘어간다.
         """
         loop = asyncio.get_running_loop()
         try:
@@ -158,20 +165,56 @@ class TickStreamer:
                 subscription = self._subscription
                 ticker = self.ticker
                 tick = self.tick
+                self._state_changed.clear()
 
                 self._bucket.reset()
-                deadline = loop.time() + tick
+                window_started_at = loop.time()
+                deadline = window_started_at + tick
+                restart_window = False
 
                 # 마감 시각까지 남은 시간만큼만 대기하며 이벤트를 모은다.
                 while (remaining := deadline - loop.time()) > 0:
+                    event_task = asyncio.create_task(subscription.get())
+                    state_task = asyncio.create_task(self._state_changed.wait())
+                    done = set()
                     try:
-                        event = await asyncio.wait_for(
-                            subscription.get(), timeout=remaining
+                        done, _ = await asyncio.wait(
+                            {event_task, state_task},
+                            timeout=remaining,
+                            return_when=asyncio.FIRST_COMPLETED,
                         )
-                    except asyncio.TimeoutError:
-                        break
-                    self._bucket.add(float(event.price), event.volume)
+                    finally:
+                        for task in (event_task, state_task):
+                            if not task.done():
+                                task.cancel()
+                        await asyncio.gather(
+                            event_task, state_task, return_exceptions=True
+                        )
 
+                    state_changed = state_task in done or self._state_changed.is_set()
+                    if state_changed:
+                        self._state_changed.clear()
+                        if subscription is not self._subscription:
+                            self._bucket.reset()
+                            restart_window = True
+                            break
+
+                        ticker = self.ticker
+                        tick = self.tick
+                        deadline = window_started_at + tick
+                        if event_task in done:
+                            event = event_task.result()
+                            self._bucket.add(float(event.price), event.volume)
+                        continue
+
+                    if event_task in done:
+                        event = event_task.result()
+                        self._bucket.add(float(event.price), event.volume)
+                    else:
+                        break
+
+                if restart_window or subscription is not self._subscription:
+                    continue
                 await self._flush(ticker, tick)
         except Exception as e:
             logger.error(f"Data streaming error: {e}")
