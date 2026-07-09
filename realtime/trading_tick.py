@@ -5,9 +5,9 @@
 공유 consumer 가 채우는 `ticker_router` 구독에서 온다(fan-out). 서로 다른 ticker
 를 요청한 두 연결은 각자 자기 구독의 이벤트만 받으므로 올바른 데이터만 수신한다.
 
-집계는 이 항목(#3) 범위에선 high/low 만 계산한다. OHLCV 전체 집계와 데이터 부재
-시 직전 종가 유지 정책은 #4/#6 에서, ticker 전환 시 유실/중복 최소화는 #5 에서
-확장한다.
+집계는 tick 윈도우 안에서 수신한 체결 이벤트의 open/high/low/close/volume 을
+계산한다(#4). 데이터 부재 시 직전 종가 유지 정책은 #6 에서, ticker 전환 시 유실/
+중복 최소화는 #5 에서 확장한다.
 """
 
 import asyncio
@@ -30,27 +30,37 @@ _TICK_UPDATE_TIMEOUT_SECONDS = 60.0
 class _TickBucket:
     """진행 중인 tick 윈도우의 집계 상태.
 
-    #3 범위에선 high/low 만 누적한다(캔들 계약 유지). open/close/volume 등
-    OHLCV 확장은 #4 에서 이 버킷 위에 얹는다.
+    이벤트가 수신된 순서대로 open(첫 가격), close(마지막 가격), high/low,
+    volume 합계를 누적한다.
     """
 
-    __slots__ = ("high", "low", "count")
+    __slots__ = ("open_price", "high", "low", "close_price", "volume", "count")
 
     def __init__(self) -> None:
+        self.open_price: float | None = None
         self.high: float | None = None
         self.low: float | None = None
+        self.close_price: float | None = None
+        self.volume: int = 0
         self.count: int = 0
 
-    def add(self, price: float) -> None:
+    def add(self, price: float, volume: int) -> None:
+        if self.open_price is None:
+            self.open_price = price
         if self.high is None or price > self.high:
             self.high = price
         if self.low is None or price < self.low:
             self.low = price
+        self.close_price = price
+        self.volume += volume
         self.count += 1
 
     def reset(self) -> None:
+        self.open_price = None
         self.high = None
         self.low = None
+        self.close_price = None
+        self.volume = 0
         self.count = 0
 
 
@@ -137,7 +147,7 @@ class TickStreamer:
         """구독 이벤트를 tick 윈도우로 묶어 캔들을 전송한다.
 
         각 윈도우 시작에서 현재 상태(구독/tick)를 스냅샷하고, 마감 시각까지 도착
-        하는 이벤트의 가격으로 high/low 를 집계한 뒤 경계에서 flush 한다. 구독을
+        하는 이벤트의 가격/거래량으로 OHLCV 를 집계한 뒤 경계에서 flush 한다. 구독을
         윈도우 시작 시점에 고정하므로, 도중 ticker 가 바뀌어도 이번 윈도우가 다른
         ticker 이벤트를 섞어 받지 않는다(다음 윈도우부터 새 구독 사용).
         """
@@ -160,7 +170,7 @@ class TickStreamer:
                         )
                     except asyncio.TimeoutError:
                         break
-                    self._bucket.add(float(event.price))
+                    self._bucket.add(float(event.price), event.volume)
 
                 await self._flush(ticker, tick)
         except Exception as e:
@@ -168,10 +178,20 @@ class TickStreamer:
 
     async def _flush(self, ticker: str, tick: int) -> None:
         """현재 버킷을 캔들로 만들어 전송하고 마지막 전송 시각을 갱신한다."""
-        high = self._bucket.high
-        low = self._bucket.low
-        if high is not None and low is not None:
-            data: TickData | None = TickData(high=high, low=low)
+        bucket = self._bucket
+        if (
+            bucket.open_price is not None
+            and bucket.high is not None
+            and bucket.low is not None
+            and bucket.close_price is not None
+        ):
+            data: TickData | None = TickData(
+                open=bucket.open_price,
+                high=bucket.high,
+                low=bucket.low,
+                close=bucket.close_price,
+                volume=bucket.volume,
+            )
         else:
             # 윈도우 내 데이터 없음 — 현재는 null 캔들(직전 종가 유지 등은 #6).
             data = None
@@ -184,4 +204,5 @@ class TickStreamer:
                 current_tick=tick,
             )
         )
+        self._bucket.reset()
         self._last_sent_at = asyncio.get_running_loop().time()

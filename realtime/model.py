@@ -27,8 +27,11 @@ class TickUpdate(TypedDict):
 
 
 class TickData(TypedDict):
+    open: float
     high: float
     low: float
+    close: float
+    volume: int
 
 
 class TradeHighAndLow(TypedDict):
