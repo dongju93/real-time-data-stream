@@ -5,7 +5,6 @@ from typing import Annotated, Any
 
 from fastapi import (
     APIRouter,
-    BackgroundTasks,
     Depends,
     FastAPI,
     HTTPException,
@@ -18,9 +17,10 @@ from anomaly import AnomalyStreamer
 from database import get_connection
 from database.connector import db_pool
 from history import StockTradeQuery, StockTradeRepository, StockTradeResponse
-from realtime import TickStreamer
+from messaging import stock_trade_consumer
+from realtime import TickStreamer, ticker_router
 from realtime.model import RealtimeTickUpdate
-from stock_generator import run_stock_data_inserter
+from stock_generator import stock_data_generator
 from utils import logger_instance, serialize_value
 
 logger = logger_instance()
@@ -32,7 +32,23 @@ async def lifespan(_: FastAPI) -> AsyncGenerator[None, None]:
     await db_pool.create()
     logger.info("Database connection pool created successfully")
 
+    # 조립 지점(#3): 공유 consumer 가 파싱한 CDC 이벤트 배치를 연결별 fan-out
+    # 라우터로 흘려보내도록 연결한다. consumer 는 라우터를 직접 임포트하지 않고
+    # 이 콜백 seam 으로만 결합해 순환 임포트를 피한다.
+    stock_trade_consumer.set_event_handler(ticker_router.route)
+
+    # Kafka 체결 데이터 consumer 시작 (브로커 구독 + 백그라운드 소비 루프)
+    await stock_trade_consumer.create()
+    logger.info("Kafka stock-trade consumer started successfully")
+
     yield
+
+    # 장수명 태스크를 먼저 중지한 뒤 해당 태스크가 사용하는 리소스를 정리한다
+    await stock_data_generator.stop()
+    logger.info("Stock data generator stopped successfully")
+
+    await stock_trade_consumer.close()
+    logger.info("Kafka stock-trade consumer stopped successfully")
 
     # 애플리케이션 종료 시 데이터베이스 풀 해제
     await db_pool.close()
@@ -64,18 +80,13 @@ async def fetch_stock_data() -> list[dict[str, Any]]:
 
 
 @stock_streamer_v1.post("/stock/generate", status_code=status.HTTP_202_ACCEPTED)
-async def generate_stock_data(background_tasks: BackgroundTasks) -> dict[str, str]:
-    """Generate stock data in the background.
-
-    Args:
-        background_tasks (BackgroundTasks): Background tasks manager.
-
-    Returns:
-        dict[str, str]: Status payload. The 202 status is declared on the route
-        decorator so the value can be returned directly.
-    """
-    background_tasks.add_task(run_stock_data_inserter)
-    return {"status": "success", "message": "Stock data generation started"}
+async def generate_stock_data() -> dict[str, str]:
+    """Start the lifespan-managed stock data generator."""
+    started = stock_data_generator.start()
+    return {
+        "status": "success",
+        "message": "started" if started else "already running",
+    }
 
 
 @stock_streamer_v1.get("/stock")
@@ -119,14 +130,22 @@ async def stream_realtime_stock_data(websocket: WebSocket) -> None:
     tick_listen_task: asyncio.Task[None] | None = None
     tick_stream_task: asyncio.Task[None] | None = None
 
+    # 연결 상태 소유자를 try 밖에서 만들어(생성 시 라우터 구독) finally 가 항상
+    # 구독을 해제할 수 있게 한다 — 연결 누수/유령 구독 방지.
+    tick_streamer = TickStreamer(
+        ticker,
+        tick,
+        websocket,
+        consumer_health_check=stock_trade_consumer.raise_if_fatal,
+        consumer_stale_check=stock_trade_consumer.is_stale,
+    )
+
     try:
         logger.info(f"Starting real-time stream for {ticker} with {tick}s tick")
 
-        stock_streamer = TickStreamer(ticker, tick, websocket)
-
         # Create both tasks
-        tick_listen_task = asyncio.create_task(stock_streamer.listen_for_tick_updates())
-        tick_stream_task = asyncio.create_task(stock_streamer.stream_data())
+        tick_listen_task = asyncio.create_task(tick_streamer.listen_for_tick_updates())
+        tick_stream_task = asyncio.create_task(tick_streamer.stream_data())
 
         # Run both task indefinitely
         await asyncio.gather(tick_listen_task, tick_stream_task)
@@ -149,6 +168,11 @@ async def stream_realtime_stock_data(websocket: WebSocket) -> None:
         if tasks_to_cancel:
             await asyncio.gather(*tasks_to_cancel, return_exceptions=True)
             logger.info("Tasks cancelled and cleaned up")
+
+        # 라우터 구독 해제(#3): 태스크 정리 후 마지막에 수행해 유령 구독을 남기지
+        # 않는다. 태스크 취소를 먼저 끝내야 stream 태스크가 이미 해제된 구독을
+        # 다시 건드리지 않는다.
+        tick_streamer.close()
 
 
 @stock_streamer_v1.get("/stock/anomaly")

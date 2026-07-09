@@ -72,6 +72,61 @@ flowchart TD
 2. 저장된 거래내역은 Change Data Capture 를 통해 Kafka 로 스트리밍된다
 3. Flink 에서는 거래내역을 실시간으로 통계 및 연산을 수행하여 이상 거래 여부를 판단한다
 
+## Local Docker Data Pipeline
+
+`docker/data-pipeline/docker-compose.yaml` — PostgreSQL(TimescaleDB), Kafka, Debezium, Flink를 한 스택으로 띄운다.
+
+### 사전 준비
+
+`docker/data-pipeline/.env.compose.local` 생성:
+
+```
+POSTGRES_PASSWORD=<your-password>
+POSTGRES_DB=stock
+```
+
+`POSTGRES_USER`를 넣지 않으면 슈퍼유저는 `postgres`다.
+
+아래 파일의 사용자명·비밀번호를 위 `POSTGRES_PASSWORD`와 맞춘다.
+
+| 파일                                     | 넣을 값                                                                                         |
+| ---------------------------------------- | ----------------------------------------------------------------------------------------------- |
+| `postgres/init/02-cdc.sql`               | CDC용 replication role (예: `debezium`)                                                         |
+| `postgres/pg_hba.conf`                   | 위 role 이름 (replication 허용 줄)                                                              |
+| `debezium/postgres-stock-connector.json` | `database.*` → CDC role, `transforms.timescaledb.database.*` → `postgres` + `POSTGRES_PASSWORD` |
+
+`01-ddl.sql`, `02-cdc.sql`은 `postgres_data` volume이 처음 만들어질 때만 실행된다.
+
+### 실행
+
+```bash
+cd docker/data-pipeline
+docker compose up -d
+./debezium/register-connector.sh
+```
+
+`register-connector.sh`는 `http://localhost:8083`에 `postgres-stock-connector.json`을 등록한다. Compose에 포함되지 않는다.
+
+### 구성
+
+| 서비스             | 역할                                            | 호스트 포트 |
+| ------------------ | ----------------------------------------------- | ----------- |
+| `postgres-stock`   | TimescaleDB, `01-ddl.sql`·`02-cdc.sql`로 초기화 | 5432        |
+| `broker`           | Kafka (KRaft)                                   | 9094        |
+| `debezium-connect` | PostgreSQL CDC → Kafka                          | 8083        |
+| `kafka-ui`         | Kafka UI                                        | 8080        |
+| `jobmanager`       | Flink JobManager                                | 8081        |
+| `taskmanager`      | Flink TaskManager                               | —           |
+
+네트워크 `stock_trade_network`. 데이터는 `postgres_data`, `kafka_data` volume에 저장된다.
+
+### 접속
+
+|            | 호스트에서 실행  | Compose 내부          |
+| ---------- | ---------------- | --------------------- |
+| PostgreSQL | `localhost:5432` | `postgres-stock:5432` |
+| Kafka      | `localhost:9094` | `broker:9092`         |
+
 ## 구현 기술 상세
 
 ### TimescaleDB: 시계열 데이터베이스 최적화
@@ -82,7 +137,7 @@ flowchart TD
 ### Debezium & Kafka: 변경 데이터 캡처(CDC) 및 이벤트 스트리밍
 
 - **CDC 설정**: Debezium PostgreSQL 커넥터가 `stock_trades` 테이블의 변경 사항을 실시간으로 감지합니다. `publication.name`으로 `dbz_publication`을 사용하여 논리적 디코딩(Logical Decoding)을 통해 변경분을 스트림으로 변환합니다.
-- **Kafka 토픽**: 감지된 모든 데이터 변경(INSERT, UPDATE, DELETE) 이벤트는 `stock.stock_trades`라는 Kafka 토픽으로 발행(Publish)됩니다. 이 토픽은 실시간 데이터 파이프라인의 중심 허브 역할을 합니다.
+- **Kafka 토픽**: 감지된 모든 데이터 변경(INSERT, UPDATE, DELETE) 이벤트는 `stock.public.stock_trades`라는 Kafka 토픽으로 발행(Publish)됩니다. 이 토픽은 실시간 데이터 파이프라인의 중심 허브 역할을 합니다.
 - **느슨한 결합**: 이 아키텍처를 통해 데이터베이스와 실시간 처리 시스템(FastAPI, Flink)이 분리됩니다. 데이터베이스는 데이터 저장에만 집중하고, 실시간 처리가 필요한 모든 애플리케이션은 Kafka 토픽을 구독(Subscribe)하여 독립적으로 확장 및 운영될 수 있습니다.
 
 ## API
@@ -112,9 +167,9 @@ flowchart TD
 
 ### 1. 실시간 Tick 스트리밍
 
-- [ ] #1 Kafka consumer 를 애플리케이션 런타임 의존성으로 반영
-- [ ] #2 Debezium CDC 메시지 스키마 파싱 로직 구현
-- [ ] #3 WebSocket 연결별 ticker / tick 상태 관리
+- [x] #1 Kafka consumer 를 애플리케이션 런타임 의존성으로 반영
+- [x] #2 Debezium CDC 메시지 스키마 파싱 로직 구현
+- [x] #3 WebSocket 연결별 ticker / tick 상태 관리
 - [ ] #4 수신 이벤트를 tick 주기 기준 candle / high-low 로 집계
 - [ ] #5 ticker 변경 시 기존 구독 해제 후 신규 구독 연결
 - [ ] #6 데이터 부재 / 지연 / consumer 오류 WebSocket 예외 처리

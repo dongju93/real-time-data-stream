@@ -62,8 +62,8 @@ class StockTradeRepository:
         cls, query: StockTradeQuery
     ) -> tuple[list[str], list[Any]]:
         """Build parameterized query conditions with validation."""
-        conditions = []
-        params = []
+        conditions: list[str] = []
+        params: list[Any] = []
         # Index for parameterized queries position
         param_index = 1
 
