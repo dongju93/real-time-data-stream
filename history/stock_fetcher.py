@@ -3,7 +3,7 @@ PostgreSQL 의 지난 기간 주식 데이터를 조회
 """
 
 from datetime import UTC, datetime, timedelta
-from typing import Annotated, Any, Self
+from typing import Annotated, Any, Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from pydantic.alias_generators import to_camel
@@ -17,6 +17,12 @@ logger = logger_instance()
 
 MAX_QUERY_RANGE = timedelta(days=30)
 MAX_QUERY_DURATION_MINUTES = int(MAX_QUERY_RANGE.total_seconds() // 60)
+Granularity = Literal["minute", "hour", "day"]
+GRANULARITY_INTERVALS: dict[Granularity, str] = {
+    "minute": "1 minute",
+    "hour": "1 hour",
+    "day": "1 day",
+}
 
 
 class StockTradeQuery(BaseModel, UppercaseAlphabetValidationMixin):
@@ -44,6 +50,10 @@ class StockTradeQuery(BaseModel, UppercaseAlphabetValidationMixin):
         str | None, Field(None, description="Trade type (BUY/SELL)")
     ] = None
     market_code: Annotated[str | None, Field(None, description="Market code")] = None
+    granularity: Annotated[
+        Granularity | None,
+        Field(None, description="Aggregation granularity (minute/hour/day)"),
+    ] = None
 
     @field_validator("trade_type")
     @classmethod
@@ -101,6 +111,7 @@ class StockTradeFilters(BaseModel):
     ticker: str | None
     trade_type: str | None
     market_code: str | None
+    granularity: Granularity | None
 
 
 class StockTradeResponse(BaseModel):
@@ -171,15 +182,33 @@ class StockTradeRepository:
         """
         conditions, params = cls._build_query_conditions(query)
 
-        # Build the complete query
-        base_query = "SELECT * FROM stock_trades"
-        if conditions:
-            where_clause: str = " WHERE " + " AND ".join(conditions)
-            sql_query: str = (
-                base_query + where_clause + " ORDER BY event_time DESC LIMIT 1000"
-            )
+        where_clause = " WHERE " + " AND ".join(conditions) if conditions else ""
+
+        if query.granularity is not None:
+            interval = GRANULARITY_INTERVALS[query.granularity]
+            bucket_expression = f"time_bucket('{interval}', event_time)"
+            sql_query = f"""
+                SELECT
+                    {bucket_expression} AS event_time,
+                    ticker,
+                    first(price, event_time) AS open,
+                    max(price) AS high,
+                    min(price) AS low,
+                    last(price, event_time) AS close,
+                    sum(volume) AS volume,
+                    count(*) AS trade_count
+                FROM stock_trades
+                {where_clause}
+                GROUP BY {bucket_expression}, ticker
+                ORDER BY event_time DESC
+                LIMIT 1000
+            """
         else:
-            sql_query = base_query + " ORDER BY event_time DESC LIMIT 1000"
+            sql_query = (
+                "SELECT * FROM stock_trades"
+                + where_clause
+                + " ORDER BY event_time DESC LIMIT 1000"
+            )
 
         async with get_connection() as conn:
             result = await conn.fetch(sql_query, *params)
@@ -200,5 +229,6 @@ class StockTradeRepository:
                     ticker=query.ticker,
                     trade_type=query.trade_type,
                     market_code=query.market_code,
+                    granularity=query.granularity,
                 ),
             )
