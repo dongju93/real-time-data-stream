@@ -6,10 +6,12 @@ import base64
 import binascii
 import json
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from typing import Annotated, Any, Literal, Self
 from uuid import UUID
 
 from pydantic import (
+    AwareDatetime,
     BaseModel,
     ConfigDict,
     Field,
@@ -20,7 +22,7 @@ from pydantic import (
 from pydantic.alias_generators import to_camel
 
 from database import get_connection
-from utils import logger_instance, serialize_value
+from utils import logger_instance
 
 from .validation_mixins import UppercaseAlphabetValidationMixin
 
@@ -201,22 +203,88 @@ class StockTradeQuery(BaseModel, UppercaseAlphabetValidationMixin):
         return self
 
 
+class StockTrade(BaseModel):
+    """A single persisted stock trade."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    event_time: AwareDatetime
+    event_id: UUID
+    ticker: Annotated[str, Field(min_length=1, max_length=10)]
+    price: Annotated[Decimal, Field(max_digits=12, decimal_places=2)]
+    volume: int
+    trade_type: Annotated[str, Field(min_length=1, max_length=10)]
+    trade_id: UUID
+    market_code: Annotated[str | None, Field(max_length=10)] = None
+    currency_code: Annotated[
+        str | None,
+        Field(min_length=3, max_length=3),
+    ] = None
+
+
+class StockTradeAggregate(BaseModel):
+    """An OHLCV bucket returned for an aggregated stock trade query."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    event_time: AwareDatetime
+    ticker: Annotated[str, Field(min_length=1, max_length=10)]
+    open: Decimal
+    high: Decimal
+    low: Decimal
+    close: Decimal
+    volume: int
+    trade_count: Annotated[int, Field(ge=0)]
+
+
 class StockTradeFilters(BaseModel):
+    """Filter values applied to the query."""
+
+    model_config = ConfigDict(extra="forbid")
+
     duration: int | None
-    start_time: datetime | None
-    end_time: datetime | None
     ticker: str | None
     trade_type: str | None
     market_code: str | None
+
+
+class StockTradeTimeRange(BaseModel):
+    """Resolved UTC time range applied to the query."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    start_time: AwareDatetime
+    end_time: AwareDatetime
+
+
+class StockTradeCursorMetadata(BaseModel):
+    """Cursor pagination state for the current response."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    current: str | None
+    next: str | None
+    limit: Annotated[int, Field(ge=1, le=MAX_PAGE_LIMIT)]
+    has_more: bool
+
+
+class StockTradeResponseMetadata(BaseModel):
+    """Standard metadata shared by raw and aggregated trade responses."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    count: Annotated[int, Field(ge=0)]
+    filters: StockTradeFilters
     granularity: Granularity | None
+    time_range: StockTradeTimeRange | None
+    cursor: StockTradeCursorMetadata
 
 
 class StockTradeResponse(BaseModel):
-    data: list[dict[str, Any]]
-    count: int
-    filters: StockTradeFilters
-    next_cursor: str | None
-    has_more: bool
+    model_config = ConfigDict(extra="forbid")
+
+    data: list[StockTrade] | list[StockTradeAggregate]
+    metadata: StockTradeResponseMetadata
 
 
 class StockTradeRepository:
@@ -224,7 +292,9 @@ class StockTradeRepository:
 
     @classmethod
     def _build_query_conditions(
-        cls, query: StockTradeQuery
+        cls,
+        query: StockTradeQuery,
+        time_range: StockTradeTimeRange | None,
     ) -> tuple[list[str], list[Any]]:
         """Build parameterized query conditions with validation."""
         conditions: list[str] = []
@@ -232,22 +302,13 @@ class StockTradeRepository:
         # Index for parameterized queries position
         param_index = 1
 
-        # Add event_time range filter if explicit range is provided
-        if query.start_time is not None and query.end_time is not None:
+        # Apply the exact resolved range also exposed in response metadata.
+        if time_range is not None:
             conditions.append(
                 f"event_time BETWEEN ${param_index} AND ${param_index + 1}"
             )
-            params.extend([query.start_time, query.end_time])
+            params.extend([time_range.start_time, time_range.end_time])
             param_index += 2
-
-        # Otherwise, preserve the duration-based event_time filter
-        elif query.duration is not None:
-            start_time: datetime = datetime.now(tz=UTC) - timedelta(
-                minutes=query.duration
-            )
-            conditions.append(f"event_time >= ${param_index}")
-            params.append(start_time)
-            param_index += 1
 
         # Add ticker filter
         if query.ticker is not None:
@@ -269,6 +330,24 @@ class StockTradeRepository:
 
         return conditions, params
 
+    @staticmethod
+    def _resolve_time_range(query: StockTradeQuery) -> StockTradeTimeRange | None:
+        """Resolve explicit or duration-based filters to one UTC time range."""
+        if query.start_time is not None and query.end_time is not None:
+            return StockTradeTimeRange(
+                start_time=query.start_time,
+                end_time=query.end_time,
+            )
+
+        if query.duration is None:
+            return None
+
+        end_time = datetime.now(tz=UTC)
+        return StockTradeTimeRange(
+            start_time=end_time - timedelta(minutes=query.duration),
+            end_time=end_time,
+        )
+
     @classmethod
     async def fetch_trades(cls, query: StockTradeQuery) -> StockTradeResponse:
         """Fetch stock trades from the database with optional filters and SQL injection protection.
@@ -279,7 +358,8 @@ class StockTradeRepository:
         Returns:
             StockTradeResponse: Filtered stock trades with metadata
         """
-        conditions, params = cls._build_query_conditions(query)
+        time_range = cls._resolve_time_range(query)
+        conditions, params = cls._build_query_conditions(query, time_range)
         cursor = _decode_cursor(query.cursor) if query.cursor is not None else None
         page_size = query.limit + 1
 
@@ -352,23 +432,34 @@ class StockTradeRepository:
 
             logger.info(f"Fetched {len(page_result)} stock trades with filters")
 
-            serialized_result: list[dict[str, Any]] = [
-                {key: serialize_value(value) for key, value in dict(record).items()}
-                for record in page_result
-            ]
+            data: list[StockTrade] | list[StockTradeAggregate]
+            if query.granularity is None:
+                data = [
+                    StockTrade.model_validate(dict(record)) for record in page_result
+                ]
+            else:
+                data = [
+                    StockTradeAggregate.model_validate(dict(record))
+                    for record in page_result
+                ]
 
             return StockTradeResponse(
-                data=serialized_result,
-                count=len(serialized_result),
-                filters=StockTradeFilters(
-                    duration=query.duration,
-                    start_time=query.start_time,
-                    end_time=query.end_time,
-                    ticker=query.ticker,
-                    trade_type=query.trade_type,
-                    market_code=query.market_code,
+                data=data,
+                metadata=StockTradeResponseMetadata(
+                    count=len(data),
+                    filters=StockTradeFilters(
+                        duration=query.duration,
+                        ticker=query.ticker,
+                        trade_type=query.trade_type,
+                        market_code=query.market_code,
+                    ),
                     granularity=query.granularity,
+                    time_range=time_range,
+                    cursor=StockTradeCursorMetadata(
+                        current=query.cursor,
+                        next=next_cursor,
+                        limit=query.limit,
+                        has_more=has_more,
+                    ),
                 ),
-                next_cursor=next_cursor,
-                has_more=has_more,
             )
