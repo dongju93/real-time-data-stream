@@ -233,17 +233,17 @@ docker compose up -d
 - [x] #1 Kafka consumer 를 애플리케이션 런타임 의존성으로 반영
 - [x] #2 Debezium CDC 메시지 스키마 파싱 로직 구현
 - [x] #3 WebSocket 연결별 ticker / tick 상태 관리
-- [ ] #4 수신 이벤트를 tick 주기 기준 candle / high-low 로 집계
-- [ ] #5 ticker 변경 시 기존 구독 해제 후 신규 구독 연결
-- [ ] #6 데이터 부재 / 지연 / consumer 오류 WebSocket 예외 처리
+- [x] #4 수신 이벤트를 tick 주기 기준 candle / high-low 로 집계
+- [x] #5 ticker 변경 시 기존 구독 해제 후 신규 구독 연결
+- [x] #6 데이터 부재 / 지연 / consumer 오류 WebSocket 예외 처리
 
 ### 2. 히스토리 조회
 
-- [ ] #7 필터 조회 API를 range query 로 확장
-- [ ] #8 분 / 시간 / 일 aggregation 쿼리 추가
-- [ ] #9 pagination / cursor 응답 도입
-- [ ] #10 응답 모델 및 validation 표준화
-- [ ] #11 대량 데이터 조회 성능 검증
+- [x] #7 필터 조회 API를 range query 로 확장
+- [x] #8 분 / 시간 / 일 aggregation 쿼리 추가
+- [x] #9 pagination / cursor 응답 도입
+- [x] #10 응답 모델 및 validation 표준화
+- [x] #11 대량 데이터 조회 성능 검증
 
 ### 3. 이상 거래 SSE
 
