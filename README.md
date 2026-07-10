@@ -49,6 +49,69 @@ flowchart TD
 | 2   | **거래 데이터 삽입 (Bulk Insert)** | 8 CPU / 16GB RAM / SSD        | 배치당 10,000건 거래 데이터                 | 처리시간 < 500ms (asyncpg COPY 메서드 사용)         |
 | 3   | **히스토리 조회 (REST API)**       | 4 CPU / 8GB RAM / TimescaleDB | 30일치 데이터 조회 (약 1,296,000건)         | 응답시간 < 2초 (TimescaleDB 파티셔닝 활용)          |
 
+### #11 대량 데이터 조회 성능 측정
+
+측정 일시: 2026-07-10 (KST)
+
+#### 실행 환경 및 스펙
+
+| 구분                | 측정 환경                                                               |
+| ------------------- | ----------------------------------------------------------------------- |
+| 호스트              | macOS 26.5.1 (Build 25F80), arm64                                       |
+| 하드웨어            | MacBook Pro (`MacBookPro18,3`), Apple M1 Pro 10코어(8P+2E), 메모리 16GB |
+| Docker              | Docker Desktop 29.6.1, aarch64, 6 CPU, 메모리 약 9.7GiB                 |
+| 애플리케이션 런타임 | Python 3.13.14, FastAPI 0.139.0, asyncpg 0.31.0, NumPy 2.5.1            |
+| 데이터베이스        | PostgreSQL 16.9, TimescaleDB 2.20.3                                     |
+| 측정 도구           | hyperfine 1.20.0, k6 2.0.0                                              |
+
+#### 실행 구성
+
+- `docker/data-pipeline/docker-compose.yaml`의 TimescaleDB, Kafka, Debezium, Kafka UI, Flink JobManager/TaskManager를 함께 실행했다.
+- FastAPI는 호스트의 `127.0.0.1:8000`에서 실행하고 TimescaleDB는 `localhost:5432`로 연결했다.
+- `stock_trades`는 `event_time` 기준 hypertable이며 청크 간격은 7일이다. 측정 범위에 포함된 청크는 6개였고 compression이 활성화되어 있었다.
+- `stock_trades`에서 기본 키를 포함한 인덱스 7개를 확인했다.
+- Debezium의 `dbz_publication`은 `stock_trades`를 대상으로 하며 connector와 task가 실행 중인 상태에서 측정했다.
+- continuous aggregate 비교를 위해 `stock_trades_1min`을 생성하고 측정 구간을 수동 refresh했다.
+
+#### 테스트 데이터 및 조회 조건
+
+| 항목                    | 값                                                              |
+| ----------------------- | --------------------------------------------------------------- |
+| 시드 삽입 건수          | 1,296,000건                                                     |
+| 시드 배치 크기          | 10,000건                                                        |
+| 시드 시간 범위          | 2026-06-10 11:34:44.227022 UTC ~ 2026-07-10 11:34:44.227022 UTC |
+| 기존 데이터 포함 조회량 | 1,508,344건                                                     |
+| 원본 조회               | 위 30일 범위, `limit=1000`                                      |
+| 분 집계 조회            | 위 30일 범위, `granularity=minute`, `limit=1000`                |
+
+현재 REST API의 pagination 상한에 따라 30일 범위의 첫 1,000건 응답을 측정했다. 분 집계 API는 `stock_trades`를 직접 집계하며 continuous aggregate 조회는 SQL로 별도 측정했다.
+
+#### 테스트 내용
+
+1. `POST /api/v1/stock/generate`에 `mode=historical`, `totalRecords=1296000`, `days=30`, `batchSize=10000`을 전달하고 완료 상태까지 대기했다.
+2. hypertable, 청크, 인덱스와 조회 범위 건수를 확인하고 `ANALYZE stock_trades`를 실행했다.
+3. 원본 범위 조회와 `stock_trades` 직접 분 집계에 `EXPLAIN (ANALYZE, BUFFERS, VERBOSE)`를 실행했다.
+4. `stock_trades_1min`을 refresh한 뒤 동일 범위의 continuous aggregate 조회 실행계획을 측정했다.
+5. hyperfine으로 원본 API와 분 집계 API를 각각 3회 워밍업 후 20회 측정했다.
+6. k6에서 5 VU로 30초 동안 각 iteration마다 원본 API와 분 집계 API를 순차 호출해 응답시간 분포를 측정했다.
+
+#### 측정 결과
+
+| 구분                  | 측정 항목                  | 결과                                  |
+| --------------------- | -------------------------- | ------------------------------------- |
+| 데이터 생성           | 1,296,000건 COPY 삽입      | 46.920초                              |
+| SQL 원본 조회         | 실행시간                   | 0.582ms                               |
+| SQL 직접 분 집계      | 실행시간                   | 6,587.098ms                           |
+| Continuous aggregate  | 30일 범위 refresh          | 16.515초                              |
+| Continuous aggregate  | 조회 실행시간              | 18.732ms                              |
+| hyperfine 원본 API    | 평균 ± 표준편차            | 34.03 ± 9.47ms                        |
+| hyperfine 원본 API    | 최소 ~ 최대                | 26.04 ~ 62.25ms                       |
+| hyperfine 분 집계 API | 평균 ± 표준편차            | 7,279.46 ± 313.02ms                   |
+| hyperfine 분 집계 API | 최소 ~ 최대                | 6,945.30 ~ 8,148.48ms                 |
+| k6 원본 API           | 평균 / 중앙값 / p95 / 최대 | 70.986 / 42.767 / 169.352 / 171.514ms |
+| k6 분 집계 API        | 평균 / 중앙값 / p95 / 최대 | 13.138 / 13.397 / 13.773 / 13.813초   |
+| k6 HTTP               | 요청 / 실패 / check        | 30건 / 0건 / 30건 성공                |
+
 ## Tech Stack
 
 - `FastAPI` - 0.115.12

@@ -5,11 +5,12 @@
 import asyncio
 import random
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Annotated, Literal
 
 import numpy as np
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic.alias_generators import to_camel
 from uuid_utils import UUID, uuid4, uuid7
 
 from database.connector import get_connection
@@ -17,6 +18,51 @@ from utils.config_loader import get_config
 from utils.logger import logger_instance
 
 logger = logger_instance()
+
+GenerationMode = Literal["continuous", "historical"]
+GenerationState = Literal["idle", "running", "completed", "failed", "stopped"]
+
+
+class StockGenerationRequest(BaseModel):
+    """Configuration for continuous generation or a finite historical seed."""
+
+    model_config = ConfigDict(
+        alias_generator=to_camel,
+        populate_by_name=True,
+        extra="forbid",
+    )
+
+    mode: GenerationMode = "continuous"
+    total_records: Annotated[int, Field(ge=1, le=5_000_000)] = 1_296_000
+    days: Annotated[int, Field(ge=1, le=30)] = 30
+    batch_size: Annotated[int, Field(ge=100, le=50_000)] = 10_000
+
+
+class StockGenerationStatus(BaseModel):
+    """Observable state for a lifespan-managed generation task."""
+
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True)
+
+    mode: GenerationMode | None
+    state: GenerationState
+    requested_records: int | None
+    inserted_records: int
+    batch_size: int | None
+    range_start: datetime | None
+    range_end: datetime | None
+    started_at: datetime | None
+    finished_at: datetime | None
+    error: str | None
+
+
+class StockGenerationStartResponse(BaseModel):
+    """Backward-compatible acknowledgement plus generation progress."""
+
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True)
+
+    status: Literal["success"] = "success"
+    message: str
+    generation: StockGenerationStatus
 
 
 class TradeData(BaseModel):
@@ -281,6 +327,45 @@ class StockDataGenerator:
         )
         return all_trades
 
+    def generate_historical_batch(
+        self,
+        batch_size: int,
+        range_start: datetime,
+        range_end: datetime,
+        seed: int,
+    ) -> list[TradeData]:
+        """Generate a deterministic, time-ordered batch within a past range."""
+        duration_seconds = (range_end - range_start).total_seconds()
+        if duration_seconds <= 0:
+            raise ValueError("range_start must be earlier than range_end")
+
+        rng = np.random.default_rng(seed)
+        time_offsets = np.sort(rng.uniform(0, duration_seconds, size=batch_size))
+        price_min = get_config("stock_generator", "data_ranges", "price_min")
+        price_max = get_config("stock_generator", "data_ranges", "price_max")
+        volume_min = get_config("stock_generator", "data_ranges", "volume_min")
+        volume_max = get_config("stock_generator", "data_ranges", "volume_max")
+
+        prices = np.round(rng.uniform(price_min, price_max, size=batch_size), 2)
+        volumes = rng.integers(volume_min, volume_max + 1, size=batch_size)
+        ticker_indices = rng.integers(0, len(self.tickers), size=batch_size)
+        trade_type_indices = rng.integers(0, len(self.trade_types), size=batch_size)
+
+        return [
+            TradeData(
+                event_time=range_start + timedelta(seconds=float(time_offsets[index])),
+                event_id=uuid7(),
+                ticker=self.tickers[ticker_indices[index]],
+                price=float(prices[index]),
+                volume=int(volumes[index]),
+                trade_type=self.trade_types[trade_type_indices[index]],
+                trade_id=uuid4(),
+                market_code=self.market_code,
+                currency_code=self.currency_code,
+            )
+            for index in range(batch_size)
+        ]
+
 
 @dataclass
 class StockDataInserter:
@@ -390,6 +475,16 @@ class StockDataGeneratorService:
     def __init__(self) -> None:
         self._task: asyncio.Task[None] | None = None
         self._stop = asyncio.Event()
+        self._mode: GenerationMode | None = None
+        self._state: GenerationState = "idle"
+        self._requested_records: int | None = None
+        self._inserted_records = 0
+        self._batch_size: int | None = None
+        self._range_start: datetime | None = None
+        self._range_end: datetime | None = None
+        self._started_at: datetime | None = None
+        self._finished_at: datetime | None = None
+        self._error: str | None = None
 
     def start(self) -> bool:
         """생성 태스크를 한 번만 시작한다."""
@@ -397,8 +492,57 @@ class StockDataGeneratorService:
             return False
 
         self._stop.clear()
+        self._mode = "continuous"
+        self._state = "running"
+        self._requested_records = None
+        self._inserted_records = 0
+        self._batch_size = None
+        self._range_start = None
+        self._range_end = None
+        self._started_at = datetime.now(tz=UTC)
+        self._finished_at = None
+        self._error = None
         self._task = asyncio.create_task(self._run(), name="stock-data-generator")
         return True
+
+    def start_historical(self, request: StockGenerationRequest) -> bool:
+        """Start one finite historical seed without overlapping another task."""
+        if self._task is not None and not self._task.done():
+            return False
+
+        range_end = datetime.now(tz=UTC)
+        range_start = range_end - timedelta(days=request.days)
+        self._stop.clear()
+        self._mode = "historical"
+        self._state = "running"
+        self._requested_records = request.total_records
+        self._inserted_records = 0
+        self._batch_size = request.batch_size
+        self._range_start = range_start
+        self._range_end = range_end
+        self._started_at = datetime.now(tz=UTC)
+        self._finished_at = None
+        self._error = None
+        self._task = asyncio.create_task(
+            self._run_historical(request, range_start, range_end),
+            name="historical-stock-data-seed",
+        )
+        return True
+
+    def status(self) -> StockGenerationStatus:
+        """Return a serializable snapshot of the current generation task."""
+        return StockGenerationStatus(
+            mode=self._mode,
+            state=self._state,
+            requested_records=self._requested_records,
+            inserted_records=self._inserted_records,
+            batch_size=self._batch_size,
+            range_start=self._range_start,
+            range_end=self._range_end,
+            started_at=self._started_at,
+            finished_at=self._finished_at,
+            error=self._error,
+        )
 
     async def stop(self) -> None:
         """실행 중인 생성 태스크를 취소하고 종료될 때까지 기다린다."""
@@ -410,6 +554,65 @@ class StockDataGeneratorService:
             self._task.cancel()
         await asyncio.gather(self._task, return_exceptions=True)
         self._task = None
+        if self._state == "running":
+            self._state = "stopped"
+            self._finished_at = datetime.now(tz=UTC)
+
+    async def _run_historical(
+        self,
+        request: StockGenerationRequest,
+        range_start: datetime,
+        range_end: datetime,
+    ) -> None:
+        """Generate and insert a finite dataset spread uniformly over the range."""
+        generator = StockDataGenerator()
+        inserter = StockDataInserter()
+        range_duration = range_end - range_start
+        generated_records = 0
+        batch_number = 0
+
+        try:
+            while generated_records < request.total_records:
+                if self._stop.is_set():
+                    self._state = "stopped"
+                    return
+
+                current_batch_size = min(
+                    request.batch_size,
+                    request.total_records - generated_records,
+                )
+                batch_start = range_start + range_duration * (
+                    generated_records / request.total_records
+                )
+                batch_end = range_start + range_duration * (
+                    (generated_records + current_batch_size) / request.total_records
+                )
+                trades = generator.generate_historical_batch(
+                    current_batch_size,
+                    batch_start,
+                    batch_end,
+                    seed=42 + batch_number,
+                )
+                inserted_count = await inserter.insert_trades_batch(trades)
+                if inserted_count != current_batch_size:
+                    raise RuntimeError(
+                        "Historical seed batch inserted an unexpected row count"
+                    )
+                generated_records += inserted_count
+                self._inserted_records = generated_records
+                batch_number += 1
+
+            self._state = "completed"
+        except asyncio.CancelledError:
+            self._state = "stopped"
+            logger.info("Historical stock data seed cancelled")
+            raise
+        except Exception as exc:
+            self._state = "failed"
+            self._error = type(exc).__name__
+            logger.exception("Historical stock data seed failed", exc_info=exc)
+        finally:
+            self._finished_at = datetime.now(tz=UTC)
 
     async def _run(self) -> None:
         """설정에 따라 주식 데이터를 생성하고 삽입한다."""
@@ -449,6 +652,7 @@ class StockDataGeneratorService:
                     inserted_count = await inserter.generate_distributed_and_insert(
                         generator, trade_transaction_per_second=random_batch_size
                     )
+                    self._inserted_records += inserted_count
                     logger.info(
                         f"📊 총 {inserted_count}건의 트레이드 데이터가 "
                         "데이터베이스에 삽입되었습니다"

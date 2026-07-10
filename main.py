@@ -23,7 +23,12 @@ from history import StockTradeQuery, StockTradeRepository, StockTradeResponse
 from messaging import stock_trade_consumer
 from realtime import TickStreamer, ticker_router
 from realtime.model import RealtimeTickUpdate
-from stock_generator import stock_data_generator
+from stock_generator import (
+    StockGenerationRequest,
+    StockGenerationStartResponse,
+    StockGenerationStatus,
+    stock_data_generator,
+)
 from utils import logger_instance, serialize_value
 
 logger = logger_instance()
@@ -161,14 +166,33 @@ async def fetch_stock_data() -> list[dict[str, Any]]:
         ]
 
 
-@stock_streamer_v1.post("/stock/generate", status_code=status.HTTP_202_ACCEPTED)
-async def generate_stock_data() -> dict[str, str]:
-    """Start the lifespan-managed stock data generator."""
-    started = stock_data_generator.start()
-    return {
-        "status": "success",
-        "message": "started" if started else "already running",
-    }
+@stock_streamer_v1.post(
+    "/stock/generate",
+    status_code=status.HTTP_202_ACCEPTED,
+    response_model=StockGenerationStartResponse,
+)
+async def generate_stock_data(
+    request: StockGenerationRequest | None = None,
+) -> StockGenerationStartResponse:
+    """Start continuous generation or a finite historical performance seed."""
+    if request is not None and request.mode == "historical":
+        started = stock_data_generator.start_historical(request)
+    else:
+        started = stock_data_generator.start()
+
+    return StockGenerationStartResponse(
+        message="started" if started else "already running",
+        generation=stock_data_generator.status(),
+    )
+
+
+@stock_streamer_v1.get(
+    "/stock/generate/status",
+    response_model=StockGenerationStatus,
+)
+async def get_stock_generation_status() -> StockGenerationStatus:
+    """Return progress for continuous generation or a historical seed."""
+    return stock_data_generator.status()
 
 
 @stock_streamer_v1.get(
