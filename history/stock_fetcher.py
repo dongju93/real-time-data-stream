@@ -3,9 +3,9 @@ PostgreSQL 의 지난 기간 주식 데이터를 조회
 """
 
 from datetime import UTC, datetime, timedelta
-from typing import Annotated, Any
+from typing import Annotated, Any, Self
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from pydantic.alias_generators import to_camel
 
 from database import get_connection
@@ -15,13 +15,29 @@ from .validation_mixins import UppercaseAlphabetValidationMixin
 
 logger = logger_instance()
 
+MAX_QUERY_RANGE = timedelta(days=30)
+MAX_QUERY_DURATION_MINUTES = int(MAX_QUERY_RANGE.total_seconds() // 60)
+
 
 class StockTradeQuery(BaseModel, UppercaseAlphabetValidationMixin):
     model_config = ConfigDict(alias_generator=to_camel, extra="forbid")
 
     duration: Annotated[
         int | None,
-        Field(None, description="Duration in minutes from current time", ge=1),
+        Field(
+            None,
+            description="Duration in minutes from current time",
+            ge=1,
+            le=MAX_QUERY_DURATION_MINUTES,
+        ),
+    ] = None
+    start_time: Annotated[
+        datetime | None,
+        Field(None, description="Range start time in ISO 8601 format"),
+    ] = None
+    end_time: Annotated[
+        datetime | None,
+        Field(None, description="Range end time in ISO 8601 format"),
     ] = None
     ticker: Annotated[str | None, Field(None, description="Stock ticker symbol")] = None
     trade_type: Annotated[
@@ -40,9 +56,48 @@ class StockTradeQuery(BaseModel, UppercaseAlphabetValidationMixin):
             raise ValueError("Invalid trade type - must be BUY or SELL")
         return value_upper
 
+    @field_validator("start_time", "end_time")
+    @classmethod
+    def normalize_time(cls, value: datetime | None) -> datetime | None:
+        """Normalize range timestamps to UTC, treating naive values as UTC."""
+        if value is None:
+            return value
+        if value.tzinfo is None:
+            return value.replace(tzinfo=UTC)
+        return value.astimezone(UTC)
+
+    @model_validator(mode="after")
+    def validate_time_filters(self) -> Self:
+        """Validate duration and explicit time range filters."""
+        has_start_time = self.start_time is not None
+        has_end_time = self.end_time is not None
+
+        if has_start_time != has_end_time:
+            raise ValueError("startTime and endTime must be provided together")
+
+        if self.duration is not None and has_start_time:
+            raise ValueError("duration cannot be used with startTime and endTime")
+
+        if self.start_time is None or self.end_time is None:
+            return self
+
+        if self.start_time >= self.end_time:
+            raise ValueError("startTime must be earlier than endTime")
+
+        if self.end_time - self.start_time > MAX_QUERY_RANGE:
+            raise ValueError("Time range cannot exceed 30 days")
+
+        now = datetime.now(tz=UTC)
+        if self.start_time > now or self.end_time > now:
+            raise ValueError("startTime and endTime cannot be in the future")
+
+        return self
+
 
 class StockTradeFilters(BaseModel):
     duration: int | None
+    start_time: datetime | None
+    end_time: datetime | None
     ticker: str | None
     trade_type: str | None
     market_code: str | None
@@ -67,8 +122,16 @@ class StockTradeRepository:
         # Index for parameterized queries position
         param_index = 1
 
-        # Add event_time filter if duration is provided
-        if query.duration is not None:
+        # Add event_time range filter if explicit range is provided
+        if query.start_time is not None and query.end_time is not None:
+            conditions.append(
+                f"event_time BETWEEN ${param_index} AND ${param_index + 1}"
+            )
+            params.extend([query.start_time, query.end_time])
+            param_index += 2
+
+        # Otherwise, preserve the duration-based event_time filter
+        elif query.duration is not None:
             start_time: datetime = datetime.now(tz=UTC) - timedelta(
                 minutes=query.duration
             )
@@ -132,6 +195,8 @@ class StockTradeRepository:
                 count=len(serialized_result),
                 filters=StockTradeFilters(
                     duration=query.duration,
+                    start_time=query.start_time,
+                    end_time=query.end_time,
                     ticker=query.ticker,
                     trade_type=query.trade_type,
                     market_code=query.market_code,
