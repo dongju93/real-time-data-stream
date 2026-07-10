@@ -46,6 +46,8 @@ class StockTradeCursor(BaseModel):
     event_time: datetime
     tie_breaker: Annotated[str, Field(min_length=1)]
     granularity: Granularity | None
+    start_time: datetime | None = None
+    end_time: datetime | None = None
 
     @field_validator("event_time")
     @classmethod
@@ -55,20 +57,50 @@ class StockTradeCursor(BaseModel):
             raise ValueError("Cursor event_time must include a timezone")
         return value.astimezone(UTC)
 
+    @field_validator("start_time", "end_time")
+    @classmethod
+    def normalize_range_time(cls, value: datetime | None) -> datetime | None:
+        """Normalize optional cursor range timestamps to UTC."""
+        if value is None:
+            return value
+        if value.tzinfo is None:
+            raise ValueError("Cursor time range must include a timezone")
+        return value.astimezone(UTC)
+
+    @model_validator(mode="after")
+    def validate_time_range(self) -> Self:
+        """Validate the optional fixed time range carried by the cursor."""
+        if (self.start_time is None) != (self.end_time is None):
+            raise ValueError("Cursor time range is incomplete")
+        if (
+            self.start_time is not None
+            and self.end_time is not None
+            and self.start_time >= self.end_time
+        ):
+            raise ValueError("Cursor time range is invalid")
+        return self
+
 
 def _encode_cursor(
     event_time: datetime,
     tie_breaker: str,
     granularity: Granularity | None,
+    start_time: datetime | None = None,
+    end_time: datetime | None = None,
 ) -> str:
     cursor = StockTradeCursor(
         version=1,
         event_time=event_time,
         tie_breaker=tie_breaker,
         granularity=granularity,
+        start_time=start_time,
+        end_time=end_time,
     )
     payload = json.dumps(
-        cursor.model_dump(mode="json"),
+        cursor.model_dump(
+            mode="json",
+            exclude={"start_time", "end_time"} if cursor.start_time is None else None,
+        ),
         separators=(",", ":"),
         sort_keys=True,
     ).encode("utf-8")
@@ -199,6 +231,14 @@ class StockTradeQuery(BaseModel, UppercaseAlphabetValidationMixin):
                 UUID(cursor.tie_breaker)
             except ValueError as exc:
                 raise ValueError("Invalid cursor") from exc
+
+        if self.duration is not None:
+            if cursor.start_time is None or cursor.end_time is None:
+                raise ValueError("Duration cursor does not contain a fixed time range")
+            if cursor.end_time - cursor.start_time != timedelta(minutes=self.duration):
+                raise ValueError("Cursor duration does not match the query")
+        elif cursor.start_time is not None or cursor.end_time is not None:
+            raise ValueError("Duration cursor requires duration")
 
         return self
 
@@ -331,7 +371,10 @@ class StockTradeRepository:
         return conditions, params
 
     @staticmethod
-    def _resolve_time_range(query: StockTradeQuery) -> StockTradeTimeRange | None:
+    def _resolve_time_range(
+        query: StockTradeQuery,
+        cursor: StockTradeCursor | None = None,
+    ) -> StockTradeTimeRange | None:
         """Resolve explicit or duration-based filters to one UTC time range."""
         if query.start_time is not None and query.end_time is not None:
             return StockTradeTimeRange(
@@ -341,6 +384,14 @@ class StockTradeRepository:
 
         if query.duration is None:
             return None
+
+        if cursor is not None:
+            if cursor.start_time is None or cursor.end_time is None:
+                raise ValueError("Duration cursor does not contain a fixed time range")
+            return StockTradeTimeRange(
+                start_time=cursor.start_time,
+                end_time=cursor.end_time,
+            )
 
         end_time = datetime.now(tz=UTC)
         return StockTradeTimeRange(
@@ -358,9 +409,9 @@ class StockTradeRepository:
         Returns:
             StockTradeResponse: Filtered stock trades with metadata
         """
-        time_range = cls._resolve_time_range(query)
-        conditions, params = cls._build_query_conditions(query, time_range)
         cursor = _decode_cursor(query.cursor) if query.cursor is not None else None
+        time_range = cls._resolve_time_range(query, cursor)
+        conditions, params = cls._build_query_conditions(query, time_range)
         page_size = query.limit + 1
 
         if query.granularity is not None:
@@ -428,6 +479,16 @@ class StockTradeRepository:
                     event_time=last_record["event_time"],
                     tie_breaker=str(last_record[tie_breaker_column]),
                     granularity=query.granularity,
+                    start_time=(
+                        time_range.start_time
+                        if query.duration is not None and time_range is not None
+                        else None
+                    ),
+                    end_time=(
+                        time_range.end_time
+                        if query.duration is not None and time_range is not None
+                        else None
+                    ),
                 )
 
             logger.info(f"Fetched {len(page_result)} stock trades with filters")
