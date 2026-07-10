@@ -2,10 +2,21 @@
 PostgreSQL 의 지난 기간 주식 데이터를 조회
 """
 
+import base64
+import binascii
+import json
 from datetime import UTC, datetime, timedelta
 from typing import Annotated, Any, Literal, Self
+from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 from pydantic.alias_generators import to_camel
 
 from database import get_connection
@@ -17,12 +28,67 @@ logger = logger_instance()
 
 MAX_QUERY_RANGE = timedelta(days=30)
 MAX_QUERY_DURATION_MINUTES = int(MAX_QUERY_RANGE.total_seconds() // 60)
+MAX_PAGE_LIMIT = 1000
 Granularity = Literal["minute", "hour", "day"]
 GRANULARITY_INTERVALS: dict[Granularity, str] = {
     "minute": "1 minute",
     "hour": "1 hour",
     "day": "1 day",
 }
+
+
+class StockTradeCursor(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    version: Literal[1]
+    event_time: datetime
+    tie_breaker: Annotated[str, Field(min_length=1)]
+    granularity: Granularity | None
+
+    @field_validator("event_time")
+    @classmethod
+    def normalize_event_time(cls, value: datetime) -> datetime:
+        """Normalize cursor timestamps to UTC and reject ambiguous timestamps."""
+        if value.tzinfo is None:
+            raise ValueError("Cursor event_time must include a timezone")
+        return value.astimezone(UTC)
+
+
+def _encode_cursor(
+    event_time: datetime,
+    tie_breaker: str,
+    granularity: Granularity | None,
+) -> str:
+    cursor = StockTradeCursor(
+        version=1,
+        event_time=event_time,
+        tie_breaker=tie_breaker,
+        granularity=granularity,
+    )
+    payload = json.dumps(
+        cursor.model_dump(mode="json"),
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return base64.urlsafe_b64encode(payload).rstrip(b"=").decode("ascii")
+
+
+def _decode_cursor(value: str) -> StockTradeCursor:
+    try:
+        encoded = value.encode("ascii")
+        padding = b"=" * (-len(encoded) % 4)
+        payload = base64.b64decode(
+            encoded + padding,
+            altchars=b"-_",
+            validate=True,
+        )
+        return StockTradeCursor.model_validate_json(payload)
+    except (
+        UnicodeEncodeError,
+        binascii.Error,
+        ValidationError,
+    ) as exc:
+        raise ValueError("Invalid cursor") from exc
 
 
 class StockTradeQuery(BaseModel, UppercaseAlphabetValidationMixin):
@@ -54,6 +120,19 @@ class StockTradeQuery(BaseModel, UppercaseAlphabetValidationMixin):
         Granularity | None,
         Field(None, description="Aggregation granularity (minute/hour/day)"),
     ] = None
+    cursor: Annotated[
+        str | None,
+        Field(None, description="Opaque cursor returned by the previous page"),
+    ] = None
+    limit: Annotated[
+        int,
+        Field(
+            MAX_PAGE_LIMIT,
+            description="Maximum number of trades returned per page",
+            ge=1,
+            le=MAX_PAGE_LIMIT,
+        ),
+    ] = MAX_PAGE_LIMIT
 
     @field_validator("trade_type")
     @classmethod
@@ -103,6 +182,24 @@ class StockTradeQuery(BaseModel, UppercaseAlphabetValidationMixin):
 
         return self
 
+    @model_validator(mode="after")
+    def validate_cursor(self) -> Self:
+        """Validate the cursor structure and its query mode."""
+        if self.cursor is None:
+            return self
+
+        cursor = _decode_cursor(self.cursor)
+        if cursor.granularity != self.granularity:
+            raise ValueError("Cursor granularity does not match the query")
+
+        if self.granularity is None:
+            try:
+                UUID(cursor.tie_breaker)
+            except ValueError as exc:
+                raise ValueError("Invalid cursor") from exc
+
+        return self
+
 
 class StockTradeFilters(BaseModel):
     duration: int | None
@@ -118,6 +215,8 @@ class StockTradeResponse(BaseModel):
     data: list[dict[str, Any]]
     count: int
     filters: StockTradeFilters
+    next_cursor: str | None
+    has_more: bool
 
 
 class StockTradeRepository:
@@ -181,42 +280,81 @@ class StockTradeRepository:
             StockTradeResponse: Filtered stock trades with metadata
         """
         conditions, params = cls._build_query_conditions(query)
-
-        where_clause = " WHERE " + " AND ".join(conditions) if conditions else ""
+        cursor = _decode_cursor(query.cursor) if query.cursor is not None else None
+        page_size = query.limit + 1
 
         if query.granularity is not None:
             interval = GRANULARITY_INTERVALS[query.granularity]
             bucket_expression = f"time_bucket('{interval}', event_time)"
+            where_clause = " WHERE " + " AND ".join(conditions) if conditions else ""
+            cursor_clause = ""
+            if cursor is not None:
+                cursor_param_index = len(params) + 1
+                cursor_clause = (
+                    "WHERE (event_time, ticker) "
+                    f"< (${cursor_param_index}, ${cursor_param_index + 1})"
+                )
+                params.extend([cursor.event_time, cursor.tie_breaker])
+
+            params.append(page_size)
             sql_query = f"""
-                SELECT
-                    {bucket_expression} AS event_time,
-                    ticker,
-                    first(price, event_time) AS open,
-                    max(price) AS high,
-                    min(price) AS low,
-                    last(price, event_time) AS close,
-                    sum(volume) AS volume,
-                    count(*) AS trade_count
-                FROM stock_trades
-                {where_clause}
-                GROUP BY {bucket_expression}, ticker
-                ORDER BY event_time DESC
-                LIMIT 1000
+                SELECT *
+                FROM (
+                    SELECT
+                        {bucket_expression} AS event_time,
+                        ticker,
+                        first(price, event_time) AS open,
+                        max(price) AS high,
+                        min(price) AS low,
+                        last(price, event_time) AS close,
+                        sum(volume) AS volume,
+                        count(*) AS trade_count
+                    FROM stock_trades
+                    {where_clause}
+                    GROUP BY {bucket_expression}, ticker
+                ) AS aggregated_trades
+                {cursor_clause}
+                ORDER BY event_time DESC, ticker DESC
+                LIMIT ${len(params)}
             """
+            tie_breaker_column = "ticker"
         else:
+            if cursor is not None:
+                cursor_param_index = len(params) + 1
+                conditions.append(
+                    "(event_time, event_id) "
+                    f"< (${cursor_param_index}, ${cursor_param_index + 1})"
+                )
+                params.extend([cursor.event_time, UUID(cursor.tie_breaker)])
+
+            where_clause = " WHERE " + " AND ".join(conditions) if conditions else ""
+            params.append(page_size)
             sql_query = (
                 "SELECT * FROM stock_trades"
                 + where_clause
-                + " ORDER BY event_time DESC LIMIT 1000"
+                + " ORDER BY event_time DESC, event_id DESC"
+                + f" LIMIT ${len(params)}"
             )
+            tie_breaker_column = "event_id"
 
         async with get_connection() as conn:
             result = await conn.fetch(sql_query, *params)
-            logger.info(f"Fetched {len(result)} stock trades with filters")
+            has_more = len(result) > query.limit
+            page_result = result[: query.limit]
+            next_cursor = None
+            if has_more and page_result:
+                last_record = page_result[-1]
+                next_cursor = _encode_cursor(
+                    event_time=last_record["event_time"],
+                    tie_breaker=str(last_record[tie_breaker_column]),
+                    granularity=query.granularity,
+                )
+
+            logger.info(f"Fetched {len(page_result)} stock trades with filters")
 
             serialized_result: list[dict[str, Any]] = [
                 {key: serialize_value(value) for key, value in dict(record).items()}
-                for record in result
+                for record in page_result
             ]
 
             return StockTradeResponse(
@@ -231,4 +369,6 @@ class StockTradeRepository:
                     market_code=query.market_code,
                     granularity=query.granularity,
                 ),
+                next_cursor=next_cursor,
+                has_more=has_more,
             )
