@@ -7,11 +7,14 @@ from fastapi import (
     APIRouter,
     Depends,
     FastAPI,
-    HTTPException,
+    Request,
     status,
 )
-from fastapi.responses import StreamingResponse
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.websockets import WebSocket, WebSocketDisconnect
+from pydantic import BaseModel, ConfigDict, Field
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from anomaly import AnomalyStreamer
 from database import get_connection
@@ -20,10 +23,35 @@ from history import StockTradeQuery, StockTradeRepository, StockTradeResponse
 from messaging import stock_trade_consumer
 from realtime import TickStreamer, ticker_router
 from realtime.model import RealtimeTickUpdate
-from stock_generator import stock_data_generator
+from stock_generator import (
+    StockGenerationRequest,
+    StockGenerationStartResponse,
+    StockGenerationStatus,
+    stock_data_generator,
+)
 from utils import logger_instance, serialize_value
 
 logger = logger_instance()
+
+
+class APIErrorDetail(BaseModel):
+    """A field-level request validation error."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    field: str
+    message: str
+    type: str
+
+
+class APIErrorResponse(BaseModel):
+    """Standard HTTP error response."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    code: str
+    message: str
+    details: list[APIErrorDetail] = Field(default_factory=list)
 
 
 @asynccontextmanager
@@ -57,6 +85,65 @@ async def lifespan(_: FastAPI) -> AsyncGenerator[None, None]:
 
 stock_streamer = FastAPI(lifespan=lifespan)
 
+
+@stock_streamer.exception_handler(RequestValidationError)
+async def handle_request_validation_error(
+    _: Request,
+    exc: RequestValidationError,
+) -> JSONResponse:
+    details = [
+        APIErrorDetail(
+            field=".".join(str(part) for part in error["loc"]),
+            message=error["msg"],
+            type=error["type"],
+        )
+        for error in exc.errors()
+    ]
+    response = APIErrorResponse(
+        code="validation_error",
+        message="Request validation failed",
+        details=details,
+    )
+    return JSONResponse(
+        status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+        content=response.model_dump(mode="json"),
+    )
+
+
+@stock_streamer.exception_handler(StarletteHTTPException)
+async def handle_http_exception(
+    _: Request,
+    exc: StarletteHTTPException,
+) -> JSONResponse:
+    response = APIErrorResponse(
+        code="http_error",
+        message=exc.detail if isinstance(exc.detail, str) else "Request failed",
+    )
+    return JSONResponse(
+        status_code=exc.status_code,
+        content=response.model_dump(mode="json"),
+        headers=exc.headers,
+    )
+
+
+@stock_streamer.exception_handler(Exception)
+async def handle_unexpected_exception(request: Request, exc: Exception) -> JSONResponse:
+    logger.exception(
+        "Unhandled error while processing %s %s",
+        request.method,
+        request.url.path,
+        exc_info=exc,
+    )
+    response = APIErrorResponse(
+        code="internal_server_error",
+        message="Failed to process request",
+    )
+    return JSONResponse(
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        content=response.model_dump(mode="json"),
+    )
+
+
 stock_streamer_v1 = APIRouter(prefix="/api/v1")
 
 
@@ -79,17 +166,48 @@ async def fetch_stock_data() -> list[dict[str, Any]]:
         ]
 
 
-@stock_streamer_v1.post("/stock/generate", status_code=status.HTTP_202_ACCEPTED)
-async def generate_stock_data() -> dict[str, str]:
-    """Start the lifespan-managed stock data generator."""
-    started = stock_data_generator.start()
-    return {
-        "status": "success",
-        "message": "started" if started else "already running",
-    }
+@stock_streamer_v1.post(
+    "/stock/generate",
+    status_code=status.HTTP_202_ACCEPTED,
+    response_model=StockGenerationStartResponse,
+)
+async def generate_stock_data(
+    request: StockGenerationRequest | None = None,
+) -> StockGenerationStartResponse:
+    """Start continuous generation or a finite historical performance seed."""
+    if request is not None and request.mode == "historical":
+        started = stock_data_generator.start_historical(request)
+    else:
+        started = stock_data_generator.start()
+
+    return StockGenerationStartResponse(
+        message="started" if started else "already running",
+        generation=stock_data_generator.status(),
+    )
 
 
-@stock_streamer_v1.get("/stock")
+@stock_streamer_v1.get(
+    "/stock/generate/status",
+    response_model=StockGenerationStatus,
+)
+async def get_stock_generation_status() -> StockGenerationStatus:
+    """Return progress for continuous generation or a historical seed."""
+    return stock_data_generator.status()
+
+
+@stock_streamer_v1.get(
+    "/stock",
+    responses={
+        status.HTTP_422_UNPROCESSABLE_CONTENT: {
+            "model": APIErrorResponse,
+            "description": "Invalid query parameters",
+        },
+        status.HTTP_500_INTERNAL_SERVER_ERROR: {
+            "model": APIErrorResponse,
+            "description": "Internal server error",
+        },
+    },
+)
 async def get_stock_trades(
     query: Annotated[StockTradeQuery, Depends()],
 ) -> StockTradeResponse:
@@ -102,15 +220,7 @@ async def get_stock_trades(
         StockTradeResponse: Filtered stock trades. Returning the model directly
         lets FastAPI serialize it (and document it in the OpenAPI schema).
     """
-    try:
-        return await StockTradeRepository.fetch_trades(query)
-
-    except Exception as e:
-        logger.error(f"Error fetching stock trades: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to fetch stock trades",
-        ) from e
+    return await StockTradeRepository.fetch_trades(query)
 
 
 # wss

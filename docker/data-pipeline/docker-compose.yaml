@@ -15,9 +15,11 @@ services:
       - ./postgres/init/02-cdc.sql:/docker-entrypoint-initdb.d/02-cdc.sql:ro
     configs:
       - source: pg_conf
-        target: /var/lib/postgresql/data/pg_hba.conf
+        target: /tmp/pg_hba.conf
     command:
       - "postgres"
+      - "-c"
+      - "hba_file=/tmp/pg_hba.conf"
       # CDC 설정
       - "-c"
       - "wal_level=logical"

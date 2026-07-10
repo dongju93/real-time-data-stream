@@ -1,3 +1,15 @@
-from .stock_fetcher import StockTradeQuery, StockTradeRepository, StockTradeResponse
+from .stock_fetcher import (
+    StockTrade,
+    StockTradeAggregate,
+    StockTradeQuery,
+    StockTradeRepository,
+    StockTradeResponse,
+)
 
-__all__ = ["StockTradeQuery", "StockTradeResponse", "StockTradeRepository"]
+__all__ = [
+    "StockTrade",
+    "StockTradeAggregate",
+    "StockTradeQuery",
+    "StockTradeRepository",
+    "StockTradeResponse",
+]
